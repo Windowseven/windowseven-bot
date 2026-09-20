@@ -5,17 +5,8 @@ async function pairCommand(sock, chatId, message, q) {
     try {
         if (!q) {
             return await sock.sendMessage(chatId, {
-                text: "Please provide valid WhatsApp number\nExample: .pair 91702395XXXX",
-                contextInfo: {
-                    forwardingScore: 1,
-                    isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                        newsletterJid: '120363161513685998@newsletter',
-                        newsletterName: 'KnightBot MD',
-                        serverMessageId: -1
-                    }
-                }
-            });
+                text: "Please provide a valid WhatsApp number\nExample: .pair 255712345678"
+            }, { quoted: message });
         }
 
         const numbers = q.split(',')
@@ -24,18 +15,11 @@ async function pairCommand(sock, chatId, message, q) {
 
         if (numbers.length === 0) {
             return await sock.sendMessage(chatId, {
-                text: "Invalid number❌️ Please use the correct format!",
-                contextInfo: {
-                    forwardingScore: 1,
-                    isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                        newsletterJid: '120363161513685998@newsletter',
-                        newsletterName: 'KnightBot MD',
-                        serverMessageId: -1
-                    }
-                }
-            });
+                text: "Invalid number❌️ Please use the international format without '+' or spaces."
+            }, { quoted: message });
         }
+
+        const pairServiceUrl = process.env.PAIR_CODE_SERVICE_URL;
 
         for (const number of numbers) {
             const whatsappID = number + '@s.whatsapp.net';
@@ -43,34 +27,22 @@ async function pairCommand(sock, chatId, message, q) {
 
             if (!result[0]?.exists) {
                 return await sock.sendMessage(chatId, {
-                    text: `That number is not registered on WhatsApp❗️`,
-                    contextInfo: {
-                        forwardingScore: 1,
-                        isForwarded: true,
-                        forwardedNewsletterMessageInfo: {
-                            newsletterJid: '120363161513685998@newsletter',
-                            newsletterName: 'KnightBot MD',
-                            serverMessageId: -1
-                        }
-                    }
-                });
+                    text: `That number is not registered on WhatsApp❗️`
+                }, { quoted: message });
+            }
+
+            if (!pairServiceUrl) {
+                return await sock.sendMessage(chatId, {
+                    text: "⚠️ Pair code service is not configured (missing PAIR_CODE_SERVICE_URL)."
+                }, { quoted: message });
             }
 
             await sock.sendMessage(chatId, {
-                text: "Wait a moment for the code",
-                contextInfo: {
-                    forwardingScore: 1,
-                    isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                        newsletterJid: '120363161513685998@newsletter',
-                        newsletterName: 'KnightBot MD',
-                        serverMessageId: -1
-                    }
-                }
-            });
+                text: "Requesting pairing code, please wait..."
+            }, { quoted: message });
 
             try {
-                const response = await axios.get(`https://knight-bot-paircode.onrender.com/code?number=${number}`);
+                const response = await axios.get(`${pairServiceUrl}/code?number=${number}`, { timeout: 15000 });
                 
                 if (response.data && response.data.code) {
                     const code = response.data.code;
@@ -78,57 +50,26 @@ async function pairCommand(sock, chatId, message, q) {
                         throw new Error('Service Unavailable');
                     }
                     
-                    await sleep(5000);
+                    await sleep(2000);
                     await sock.sendMessage(chatId, {
-                        text: `Your pairing code: ${code}`,
-                        contextInfo: {
-                            forwardingScore: 1,
-                            isForwarded: true,
-                            forwardedNewsletterMessageInfo: {
-                                newsletterJid: '120363161513685998@newsletter',
-                                newsletterName: 'KnightBot MD',
-                                serverMessageId: -1
-                            }
-                        }
-                    });
+                        text: `Your pairing code: ${code}`
+                    }, { quoted: message });
                 } else {
                     throw new Error('Invalid response from server');
                 }
             } catch (apiError) {
-                console.error('API Error:', apiError);
-                const errorMessage = apiError.message === 'Service Unavailable' 
-                    ? "Service is currently unavailable. Please try again later."
-                    : "Failed to generate pairing code. Please try again later.";
-                
+                console.error('API Error in pair command:', apiError.message || apiError);
                 await sock.sendMessage(chatId, {
-                    text: errorMessage,
-                    contextInfo: {
-                        forwardingScore: 1,
-                        isForwarded: true,
-                        forwardedNewsletterMessageInfo: {
-                            newsletterJid: '120363161513685998@newsletter',
-                            newsletterName: 'KnightBot MD',
-                            serverMessageId: -1
-                        }
-                    }
-                });
+                    text: "Failed to generate pairing code. Please try again later."
+                }, { quoted: message });
             }
         }
     } catch (error) {
-        console.error(error);
+        console.error('Error in pair command:', error);
         await sock.sendMessage(chatId, {
-            text: "An error occurred. Please try again later.",
-            contextInfo: {
-                forwardingScore: 1,
-                isForwarded: true,
-                forwardedNewsletterMessageInfo: {
-                    newsletterJid: '120363161513685998@newsletter',
-                    newsletterName: 'KnightBot MD',
-                    serverMessageId: -1
-                }
-            }
-        });
+            text: "An error occurred while generating pair code."
+        }, { quoted: message });
     }
 }
 
-module.exports = pairCommand; 
+module.exports = pairCommand;

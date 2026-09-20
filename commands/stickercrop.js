@@ -31,16 +31,7 @@ async function stickercropCommand(sock, chatId, message) {
 
     if (!mediaMessage) {
         await sock.sendMessage(chatId, { 
-            text: 'Please reply to an image/video/sticker with .crop, or send an image/video/sticker with .crop as the caption.',
-            contextInfo: {
-                forwardingScore: 999,
-                isForwarded: true,
-                forwardedNewsletterMessageInfo: {
-                    newsletterJid: '120363161513685998@newsletter',
-                    newsletterName: 'KnightBot MD',
-                    serverMessageId: -1
-                }
-            }
+            text: 'Please reply to an image/video/sticker with .crop, or send an image/video/sticker with .crop as the caption.'
         },{ quoted: messageToQuote });
         return;
     }
@@ -53,16 +44,7 @@ async function stickercropCommand(sock, chatId, message) {
 
         if (!mediaBuffer) {
             await sock.sendMessage(chatId, { 
-                text: 'Failed to download media. Please try again.',
-                contextInfo: {
-                    forwardingScore: 999,
-                    isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                        newsletterJid: '120363161513685998@newsletter',
-                        newsletterName: 'KnightBot MD',
-                        serverMessageId: -1
-                    }
-                }
+                text: 'Failed to download media. Please try again.'
             });
             return;
         }
@@ -181,16 +163,7 @@ async function stickercropCommand(sock, chatId, message) {
     } catch (error) {
         console.error('Error in stickercrop command:', error);
         await sock.sendMessage(chatId, { 
-            text: 'Failed to crop sticker! Try with an image.',
-            contextInfo: {
-                forwardingScore: 999,
-                isForwarded: true,
-                forwardedNewsletterMessageInfo: {
-                    newsletterJid: '120363161513685998@newsletter',
-                    newsletterName: 'KnightBot MD',
-                    serverMessageId: -1
-                }
-            }
+            text: 'Failed to crop sticker! Try with an image.'
         });
     }
 }

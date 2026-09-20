@@ -31,16 +31,7 @@ async function stickerCommand(sock, chatId, message) {
 
     if (!mediaMessage) {
         await sock.sendMessage(chatId, { 
-            text: 'Please reply to an image/video with .sticker, or send an image/video with .sticker as the caption.',
-            contextInfo: {
-                forwardingScore: 999,
-                isForwarded: true,
-                forwardedNewsletterMessageInfo: {
-                    newsletterJid: '120363161513685998@newsletter',
-                    newsletterName: 'KnightBot MD',
-                    serverMessageId: -1
-                }
-            }
+            text: 'Please reply to an image/video with .sticker, or send an image/video with .sticker as the caption.'
         },{ quoted: messageToQuote });
         return;
     }
@@ -53,16 +44,7 @@ async function stickerCommand(sock, chatId, message) {
 
         if (!mediaBuffer) {
             await sock.sendMessage(chatId, { 
-                text: 'Failed to download media. Please try again.',
-                contextInfo: {
-                    forwardingScore: 999,
-                    isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                        newsletterJid: '120363161513685998@newsletter',
-                        newsletterName: 'KnightBot MD',
-                        serverMessageId: -1
-                    }
-                }
+                text: 'Failed to download media. Please try again.'
             });
             return;
         }
@@ -151,7 +133,7 @@ async function stickerCommand(sock, chatId, message) {
         // Create metadata
         const json = {
             'sticker-pack-id': crypto.randomBytes(32).toString('hex'),
-            'sticker-pack-name': settings.packname || 'KnightBot',
+            'sticker-pack-name': settings.packname || 'Windowseven MD',
             'emojis': ['🤖']
         };
 
@@ -181,7 +163,7 @@ async function stickerCommand(sock, chatId, message) {
                     await img2.load(smallWebp);
                     const json2 = {
                         'sticker-pack-id': crypto.randomBytes(32).toString('hex'),
-                        'sticker-pack-name': settings.packname || 'KnightBot',
+                        'sticker-pack-name': settings.packname || 'Windowseven MD',
                         'emojis': ['🤖']
                     };
                     const exifAttr2 = Buffer.from([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x41, 0x57, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00]);
@@ -211,16 +193,7 @@ async function stickerCommand(sock, chatId, message) {
     } catch (error) {
         console.error('Error in sticker command:', error);
         await sock.sendMessage(chatId, { 
-            text: 'Failed to create sticker! Try again later.',
-            contextInfo: {
-                forwardingScore: 999,
-                isForwarded: true,
-                forwardedNewsletterMessageInfo: {
-                    newsletterJid: '120363161513685998@newsletter',
-                    newsletterName: 'KnightBot MD',
-                    serverMessageId: -1
-                }
-            }
+            text: 'Failed to create sticker! Try again later.'
         });
     }
 }

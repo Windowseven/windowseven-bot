@@ -50,8 +50,12 @@ async function reminiCommand(sock, chatId, message, args) {
             }
         }
 
+        const apiKey = process.env.PRINCETECH_API_KEY;
+        if (!apiKey) {
+            return sock.sendMessage(chatId, { text: '⚠️ Remini service is currently not configured (missing PRINCETECH_API_KEY).' }, { quoted: message });
+        }
         // Call the Remini API
-        const apiUrl = `https://api.princetechn.com/api/tools/remini?apikey=prince_tech_api_azfsbshfb&url=${encodeURIComponent(imageUrl)}`;
+        const apiUrl = `https://api.princetechn.com/api/tools/remini?apikey=${apiKey}&url=${encodeURIComponent(imageUrl)}`;
         
         const response = await axios.get(apiUrl, {
             timeout: 60000, // 60 second timeout (AI processing takes longer)

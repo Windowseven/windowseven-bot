@@ -23,7 +23,7 @@ async function muteCommand(sock, chatId, senderId, message, durationInMinutes) {
             await sock.sendMessage(chatId, { text: `The group has been muted for ${durationInMinutes} minutes.` }, { quoted: message });
             
             // Set timeout to unmute after duration
-            setTimeout(async () => {
+            const muteTimer = setTimeout(async () => {
                 try {
                     await sock.groupSettingUpdate(chatId, 'not_announcement');
                     await sock.sendMessage(chatId, { text: 'The group has been unmuted.' });
@@ -31,6 +31,9 @@ async function muteCommand(sock, chatId, senderId, message, durationInMinutes) {
                     console.error('Error unmuting group:', unmuteError);
                 }
             }, durationInMilliseconds);
+            if (typeof muteTimer.unref === 'function') {
+                muteTimer.unref();
+            }
         } else {
             await sock.sendMessage(chatId, { text: 'The group has been muted.' }, { quoted: message });
         }

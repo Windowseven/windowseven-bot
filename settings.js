@@ -1,16 +1,17 @@
+require('dotenv').config();
+
 const settings = {
-  packname: 'Knight Bot',
-  author: '‎',
-  botName: "Knight Bot",
-  botOwner: 'Professor', // Your name
-  ownerNumber: '919876543210', //Set your number here without + symbol, just add country code & number without any space
-  giphyApiKey: 'qnl7ssQChTdPjsKta2Ax2LMaGXz303tq',
-  commandMode: "public",
-  maxStoreMessages: 20, 
-  storeWriteInterval: 10000,
-  description: "This is a bot for managing group commands and automating tasks.",
-  version: "3.0.7",
-  updateZipUrl: "https://github.com/mruniquehacker/Knightbot-MD/archive/refs/heads/main.zip",
+  packname: process.env.PACK_NAME || 'Windowseven MD',
+  author: process.env.PACK_AUTHOR || 'Windowseven',
+  botName: process.env.BOT_NAME || 'Windowseven MD',
+  botOwner: process.env.BOT_OWNER || 'Windowseven Admin',
+  ownerNumber: process.env.OWNER_NUMBER || '', // Transitional fallback only
+  giphyApiKey: process.env.GIPHY_API_KEY || '',
+  commandMode: process.env.COMMAND_MODE || 'public',
+  maxStoreMessages: parseInt(process.env.MAX_STORE_MESSAGES, 10) || 20, 
+  storeWriteInterval: parseInt(process.env.STORE_WRITE_INTERVAL, 10) || 10000,
+  description: "Windowseven MD - Multi-tenant WhatsApp Bot & Management Platform",
+  version: "1.0.0",
 };
 
 module.exports = settings;

@@ -23,7 +23,7 @@ setInterval(() => {
         }
     });
     console.log('🧹 Temp folder auto-cleaned');
-}, 3 * 60 * 60 * 1000);
+}, 3 * 60 * 60 * 1000).unref();
 
 const settings = require('./settings');
 require('./config.js');
@@ -146,21 +146,11 @@ const soraCommand = require('./commands/sora');
 // Global settings
 global.packname = settings.packname;
 global.author = settings.author;
-global.channelLink = "https://whatsapp.com/channel/0029Va90zAnIHphOuO8Msp3A";
-global.ytch = "Mr Unique Hacker";
+global.channelLink = "";
+global.ytch = "";
 
-// Add this near the top of main.js with other global configurations
-const channelInfo = {
-    contextInfo: {
-        forwardingScore: 1,
-        isForwarded: true,
-        forwardedNewsletterMessageInfo: {
-            newsletterJid: '120363161513685998@newsletter',
-            newsletterName: 'KnightBot MD',
-            serverMessageId: -1
-        }
-    }
-};
+// Neutralized channel info (newsletter spoofing removed)
+const channelInfo = {};
 
 async function handleMessages(sock, messageUpdate, printLog) {
     try {
@@ -274,11 +264,16 @@ async function handleMessages(sock, messageUpdate, printLog) {
         // Check for bad words and antilink FIRST, before ANY other processing
         // Always run moderation in groups, regardless of mode
         if (isGroup) {
-            if (userMessage) {
-                await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
+            // In Windowseven MD multi-tenant runtime, automatic group moderation
+            // is handled authoritatively by ApplicationPipeline via PostgreSQL.
+            // Disable legacy JSON-based moderation to prevent bypass/duplicate execution.
+            if (!sock.tenantContext) {
+                if (userMessage) {
+                    await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
+                }
+                // Antilink checks message text internally, so run it even if userMessage is empty
+                await Antilink(message, sock);
             }
-            // Antilink checks message text internally, so run it even if userMessage is empty
-            await Antilink(message, sock);
         }
 
         // PM blocker: block non-owner DMs when enabled (do not ban)
@@ -317,12 +312,26 @@ async function handleMessages(sock, messageUpdate, printLog) {
             return;
         }
 
+        // In Windowseven MD multi-tenant runtime, migrated SaaS commands must never
+        // be executed via legacy fallback.
+        if (sock.tenantContext && isGroup) {
+            const migratedPrefixes = [
+                '.warn', '.warnings', '.warns', '.checkwarn',
+                '.resetwarn', '.clearwarn', '.resetwarns', '.clearwarns',
+                '.antilink', '.mute', '.unmute', '.kick', '.promote', '.demote'
+            ];
+            const isMigrated = migratedPrefixes.some(p => userMessage.startsWith(p));
+            if (isMigrated) {
+                return;
+            }
+        }
+
         // List of admin commands
         const adminCommands = ['.mute', '.unmute', '.ban', '.unban', '.promote', '.demote', '.kick', '.tagall', '.tagnotadmin', '.hidetag', '.antilink', '.antitag', '.setgdesc', '.setgname', '.setgpp'];
         const isAdminCommand = adminCommands.some(cmd => userMessage.startsWith(cmd));
 
         // List of owner commands
-        const ownerCommands = ['.mode', '.autostatus', '.antidelete', '.cleartmp', '.setpp', '.clearsession', '.areact', '.autoreact', '.autotyping', '.autoread', '.pmblocker'];
+        const ownerCommands = ['.mode', '.autostatus', '.antidelete', '.cleartmp', '.setpp', '.areact', '.autoreact', '.autotyping', '.autoread', '.pmblocker'];
         const isOwnerCommand = ownerCommands.some(cmd => userMessage.startsWith(cmd));
 
         let isSenderAdmin = false;
@@ -825,7 +834,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 await viewOnceCommand(sock, chatId, message);
                 break;
             case userMessage === '.clearsession' || userMessage === '.clearsesi':
-                await clearSessionCommand(sock, chatId, message);
+                await sock.sendMessage(chatId, { text: '❌ The .clearsession command has been permanently disabled for security reasons in Windowseven MD.' }, { quoted: message });
                 break;
             case userMessage.startsWith('.autostatus'):
                 const autoStatusArgs = userMessage.split(' ').slice(1);
@@ -1147,11 +1156,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 commandExecuted = true;
                 break;
             case userMessage.startsWith('.update'):
-                {
-                    const parts = rawText.trim().split(/\s+/);
-                    const zipArg = parts[1] && parts[1].startsWith('http') ? parts[1] : '';
-                    await updateCommand(sock, chatId, message, zipArg);
-                }
+                await sock.sendMessage(chatId, { text: '❌ The .update command has been permanently disabled for security reasons in Windowseven MD.' }, { quoted: message });
                 commandExecuted = true;
                 break;
             case userMessage.startsWith('.removebg') || userMessage.startsWith('.rmbg') || userMessage.startsWith('.nobg'):

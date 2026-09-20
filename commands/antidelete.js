@@ -51,7 +51,7 @@ const cleanTempFolderIfLarge = () => {
 };
 
 // Start periodic cleanup check every 1 minute
-setInterval(cleanTempFolderIfLarge, 60 * 1000);
+setInterval(cleanTempFolderIfLarge, 60 * 1000).unref();
 
 // Load config
 function loadAntideleteConfig() {

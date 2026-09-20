@@ -96,7 +96,7 @@ function startAutoClear() {
             console.error(`[Auto Clear] ${result.message}`);
         }
         // No log for success, regardless of count
-    }, 6 * 60 * 60 * 1000); // 6 hours in milliseconds
+    }, 6 * 60 * 60 * 1000).unref(); // 6 hours in milliseconds
 }
 
 // Start the automatic clearing

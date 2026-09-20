@@ -13,8 +13,8 @@ async function takeCommand(sock, chatId, message, args) {
             return;
         }
 
-        // Get the packname from args or use default
-        const packname = args.join(' ') || 'Knight Bot';
+        const settings = require('../settings');
+        const packname = args.join(' ') || (settings.packname || 'Windowseven MD');
 
         try {
             // Download the sticker

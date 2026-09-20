@@ -1,16 +1,8 @@
 const axios = require('axios');
 const mumaker = require('mumaker');
 
-// Base channel info template
-const channelInfo = {
-    forwardingScore: 1,
-    isForwarded: true,
-    forwardedNewsletterMessageInfo: {
-        newsletterJid: '120363161513685998@newsletter',
-        newsletterName: 'KnightBot MD',
-        serverMessageId: -1
-    }
-};
+// Base channel info template (neutralized)
+const channelInfo = {};
 
 // Reusable message templates
 const messageTemplates = {

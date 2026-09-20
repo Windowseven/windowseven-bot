@@ -1,24 +1,23 @@
 {
-  "name": "knightbot",
+  "name": "windowseven-md",
   "version": "1.0.0",
-  "description": "WhatsApp Bot",
+  "description": "Windowseven MD - Multi-tenant WhatsApp Bot & Management Platform",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "start:optimized": "node --max-old-space-size=512 --optimize-for-size --gc-interval=100 index.js",
-    "cleanup": "node cleanup.js",
-    "reset-session": "node reset-session.js",
-    "start:clean": "npm run cleanup && npm run start:optimized",
-    "start:fresh": "npm run reset-session && npm start",
-    "install:panel": "npm install --legacy-peer-deps",
-    "install:force": "npm install --force",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "docker:build": "docker build -t docker run -e SESSION_ID=$SESSION_ID knightbot"
+    "test": "NODE_ENV=test node --test --test-concurrency=1 test/**/*.test.js",
+    "db:migrate": "node src/database/migrator.js up",
+    "db:migrate:down": "node src/database/migrator.js down",
+    "db:status": "node src/database/migrator.js status"
   },
   "keywords": [
-    "whatsapp-bot"
+    "whatsapp-bot",
+    "windowseven",
+    "baileys",
+    "multi-tenant"
   ],
-  "author": "",
+  "author": "Windowseven",
   "license": "ISC",
   "dependencies": {
     "@adiwajshing/keyed-db": "^0.2.4",
@@ -26,6 +25,7 @@
     "@hapi/boom": "^10.0.1",
     "@types/node": "^18.0.6",
     "@whiskeysockets/baileys": "^v7.0.0-rc.9",
+    "argon2": "0.45.1",
     "awesome-phonenumber": "^5.9.0",
     "axios": "^1.8.4",
     "chalk": "^4.1.2",
@@ -52,6 +52,7 @@
     "node-webpmux": "^3.1.0",
     "node-youtube-music": "^0.8.3",
     "performance-now": "^2.1.0",
+    "pg": "^8.23.0",
     "phin": "^3.7.1",
     "pino": "^8.21.0",
     "qrcode": "^1.5.4",
