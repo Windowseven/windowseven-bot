@@ -20,12 +20,14 @@ const GroupSynchronizer = require('./GroupSynchronizer');
 const { createPipeline } = require('../application/createPipeline');
 
 class ConnectionManager {
-    constructor(pool) {
+    constructor(pool, options = {}) {
         this.pool = pool || getPool();
+        this.options = options;
         this.connRepo = new WhatsAppConnectionRepository(this.pool);
         this.credsRepo = new WhatsAppAuthCredentialsRepository(this.pool);
         this.keysRepo = new WhatsAppAuthKeysRepository(this.pool);
         this.groupSynchronizer = new GroupSynchronizer(this.pool);
+        this.socketFactory = options.socketFactory || null;
 
         // In-memory registry: Map<connectionId, RuntimeConnection>
         this.connections = new Map();
@@ -94,10 +96,15 @@ class ConnectionManager {
             throw new Error(`[ConnectionManager] Connection ${connectionId} not found for tenant ${tenantId}`);
         }
 
+        if (!options.workerId || options.leaseEpoch === undefined || options.leaseEpoch === null) {
+            throw new Error('[ConnectionManager] workerId and leaseEpoch are required for a managed socket');
+        }
+        const fence = { workerId: options.workerId, leaseEpoch: options.leaseEpoch };
         // 3. Load DB-backed Auth State (Fails closed on error/corruption)
         const { state, saveCreds } = await useDatabaseAuthState(tenantId, connectionId, {
             credsRepo: this.credsRepo,
             keysRepo: this.keysRepo,
+            fence,
         });
 
         // 4. Runtime connection record
@@ -133,44 +140,58 @@ class ConnectionManager {
         const { tenantId, connectionId, state, saveCreds, options } = runtimeConn;
 
         try {
-            await this.connRepo.updateStatusForTenant(connectionId, tenantId, 'CONNECTING');
+            await this.connRepo.updateActualState({ connectionId, workerId: options.workerId, leaseEpoch: options.leaseEpoch, actualState: 'SOCKET_STARTING', status: 'CONNECTING' });
             runtimeConn.status = 'CONNECTING';
 
-            let version;
-            try {
-                const versionInfo = await fetchLatestBaileysVersion();
-                version = versionInfo.version;
-            } catch (_) {
-                // Fallback default if offline / test environment
-                version = [2, 3000, 1015901307];
+            let socket;
+            const factory = runtimeConn.options?.socketFactory || this.socketFactory;
+            if (typeof factory === 'function') {
+                socket = await factory({
+                    tenantId,
+                    connectionId,
+                    options,
+                    state,
+                    saveCreds,
+                });
+            } else {
+                let version = options.version;
+                if (!version) {
+                    try {
+                        const versionInfo = await fetchLatestBaileysVersion();
+                        version = versionInfo.version;
+                    } catch (_) {
+                        // Fallback default if offline / test environment
+                        version = [2, 3000, 1015901307];
+                    }
+                }
+
+                if (this.isShuttingDown || runtimeConn.isAborted) {
+                    return null;
+                }
+
+                const logger = pino({ level: 'silent' });
+                const msgRetryCounterCache = new NodeCache();
+
+                // Sole authoritative makeWASocket instantiation
+                socket = makeWASocket({
+                    version,
+                    logger,
+                    printQRInTerminal: options.printQRInTerminal !== false && !options.pairingCode,
+                    browser: options.browser || ['Ubuntu', 'Chrome', '20.0.04'],
+                    auth: {
+                        creds: state.creds,
+                        keys: makeCacheableSignalKeyStore(state.keys, logger),
+                    },
+                    markOnlineOnConnect: true,
+                    generateHighQualityLinkPreview: true,
+                    syncFullHistory: false,
+                    msgRetryCounterCache,
+                    defaultQueryTimeoutMs: 60000,
+                    connectTimeoutMs: 60000,
+                    keepAliveIntervalMs: 10000,
+                    ...(options.socketOverrides || {}),
+                });
             }
-
-            if (this.isShuttingDown || runtimeConn.isAborted) {
-                return null;
-            }
-
-            const logger = pino({ level: 'silent' });
-            const msgRetryCounterCache = new NodeCache();
-
-            // Sole authoritative makeWASocket instantiation
-            const socket = makeWASocket({
-                version,
-                logger,
-                printQRInTerminal: options.printQRInTerminal !== false && !options.pairingCode,
-                browser: options.browser || ['Ubuntu', 'Chrome', '20.0.04'],
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, logger),
-                },
-                markOnlineOnConnect: true,
-                generateHighQualityLinkPreview: true,
-                syncFullHistory: false,
-                msgRetryCounterCache,
-                defaultQueryTimeoutMs: 60000,
-                connectTimeoutMs: 60000,
-                keepAliveIntervalMs: 10000,
-                ...(options.socketOverrides || {}),
-            });
 
             if (this.isShuttingDown || runtimeConn.isAborted) {
                 try {
@@ -201,6 +222,8 @@ class ConnectionManager {
             const ctx = createExecutionContext({
                 tenantId,
                 connectionId,
+                workerId: options.workerId,
+                leaseEpoch: options.leaseEpoch,
                 socket,
                 pool: this.pool,
                 repositories: {
@@ -243,7 +266,7 @@ class ConnectionManager {
         } catch (err) {
             runtimeConn.lifecycleState = 'FAILED';
             runtimeConn.status = 'DISCONNECTED';
-            await this.connRepo.updateStatusForTenant(connectionId, tenantId, 'DISCONNECTED').catch(() => {});
+            await this.connRepo.updateActualState({ connectionId, workerId: options.workerId, leaseEpoch: options.leaseEpoch, actualState: 'FAILED', status: 'DISCONNECTED', lastErrorCode: 'SOCKET_START_ERROR' }).catch(() => {});
             throw new Error(`[ConnectionManager] Failed starting socket for ${connectionId}: ${err.message}`);
         }
     }
@@ -270,7 +293,7 @@ class ConnectionManager {
             runtimeConn.lifecycleState = 'RUNNING';
             runtimeConn.reconnectAttempts = 0;
 
-            await this.connRepo.updateStatusForTenant(connectionId, tenantId, 'CONNECTED').catch(() => {});
+            await this.connRepo.updateActualState({ connectionId, workerId: options.workerId, leaseEpoch: options.leaseEpoch, actualState: 'ACTIVE', status: 'CONNECTED' }).catch(() => {});
 
             // Trigger failure-isolated group discovery synchronization in background
             if (runtimeConn.ctx) {
@@ -303,7 +326,7 @@ class ConnectionManager {
                 console.warn(`[ConnectionManager] Connection ${connectionId} terminated with fatal status ${statusCode}. Reconnect aborted.`);
                 // Clean up credentials on explicit logout
                 if (isLoggedOut) {
-                    await this.credsRepo.deleteCredentials(tenantId, connectionId).catch(() => {});
+                    await this.credsRepo.deleteCredentials(tenantId, connectionId, { workerId: options.workerId, leaseEpoch: options.leaseEpoch }).catch(() => {});
                 }
                 return;
             }
@@ -402,6 +425,64 @@ class ConnectionManager {
     }
 
     /**
+     * Gets the active Baileys socket for a managed connection.
+     * @param {string} connectionId
+     * @returns {object|null}
+     */
+    getSocket(connectionId) {
+        const conn = this.connections.get(connectionId);
+        return conn ? (conn.socket || conn.sock || null) : null;
+    }
+
+    /**
+     * Requests a WhatsApp pairing code from the active Baileys socket for phone-number linking.
+     * Respects worker ownership and fences with leaseEpoch where provided.
+     *
+     * @param {string} connectionId
+     * @param {string} phoneNumber - Clean numeric phone number without + or special characters
+     * @param {object} [fence]
+     * @param {number} [fence.leaseEpoch]
+     * @returns {Promise<string>} Formatted pairing code (e.g., ABCD-EFGH)
+     */
+    async requestPairingCode(connectionId, phoneNumber, fence = {}) {
+        if (!connectionId) throw new Error('[ConnectionManager] connectionId is required for pairing code');
+        if (!phoneNumber) throw new Error('[ConnectionManager] phoneNumber is required for pairing code');
+
+        const conn = this.connections.get(connectionId);
+        if (!conn) {
+            const err = new Error('Connection is not registered or active on this node');
+            err.code = 'CONNECTION_NOT_FOUND';
+            throw err;
+        }
+
+        if (fence.leaseEpoch !== undefined && fence.leaseEpoch !== null) {
+            if (Number(conn.options?.leaseEpoch) !== Number(fence.leaseEpoch)) {
+                const err = new Error('Stale worker generation lease epoch');
+                err.code = 'STALE_LEASE_EPOCH';
+                throw err;
+            }
+        }
+
+        const socket = conn.socket || conn.sock;
+        if (!socket || typeof socket.requestPairingCode !== 'function') {
+            const err = new Error('WhatsApp socket is not connected or pairing is unavailable');
+            err.code = 'SOCKET_UNAVAILABLE';
+            throw err;
+        }
+
+        const cleanPhone = String(phoneNumber).replace(/[^0-9]/g, '');
+        if (!cleanPhone || cleanPhone.length < 7) {
+            const err = new Error('Invalid phone number format for pairing code');
+            err.code = 'INVALID_PHONE_NUMBER';
+            throw err;
+        }
+
+        const rawCode = await socket.requestPairingCode(cleanPhone);
+        const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+        return formatted;
+    }
+
+    /**
      * Gracefully disconnects and unregisters a single connection.
      */
     async disconnectConnection(connectionId, reason = 'manual_disconnect') {
@@ -419,11 +500,23 @@ class ConnectionManager {
 
         if (conn.socket) {
             try {
-                conn.socket.end(new Error(reason));
+                if (conn.socket.ws && typeof conn.socket.ws.terminate === 'function') {
+                    conn.socket.ws.terminate();
+                } else if (typeof conn.socket.end === 'function') {
+                    conn.socket.end(new Error(reason));
+                }
             } catch (_) {}
         }
 
-        await this.connRepo.updateStatusForTenant(connectionId, conn.tenantId, 'DISCONNECTED').catch(() => {});
+        await this.connRepo.updateActualState({
+            connectionId,
+            workerId: conn.options.workerId,
+            leaseEpoch: conn.options.leaseEpoch,
+            actualState: 'DISCONNECTED',
+            status: 'DISCONNECTED',
+        }).catch(() => {});
+        // The caller owns lease release. Socket end only starts
+        // runtime teardown and does not prove physical or remote liveness.
         this.connections.delete(connectionId);
         return true;
     }
@@ -446,7 +539,11 @@ class ConnectionManager {
 
             if (conn.socket) {
                 try {
-                    conn.socket.end(new Error('Manager shutting down'));
+                    if (conn.socket.ws && typeof conn.socket.ws.terminate === 'function') {
+                        conn.socket.ws.terminate();
+                    } else if (typeof conn.socket.end === 'function') {
+                        conn.socket.end(new Error('Manager shutting down'));
+                    }
                 } catch (_) {}
             }
             closePromises.push(

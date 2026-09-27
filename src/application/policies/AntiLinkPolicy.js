@@ -19,8 +19,10 @@ class AntiLinkPolicy {
             return PolicyDecision.allow('AntiLinkPolicy');
         }
 
-        // WhatsApp group admins are exempt from anti-link penalties
-        if (actor && actor.isSenderAdmin) {
+        // WhatsApp group admins are exempt if settings.exempt_admins is true (or default omitted)
+        // If settings.exempt_admins === false, group admins are subject to policy evaluation.
+        const exemptAdmins = groupPolicy.settings?.exempt_admins !== false;
+        if (actor && actor.isSenderAdmin && exemptAdmins) {
             return PolicyDecision.allow('AntiLinkPolicy');
         }
 

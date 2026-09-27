@@ -68,13 +68,18 @@ class ConnectionCommandRepository {
         }
 
         const selectSql = `
-            SELECT id, attempt_count, max_attempts
+            SELECT id, status, remote_started_at, attempt_count, max_attempts
             FROM connection_commands
             WHERE connection_id = $1
               AND (
                   (status = 'PENDING' AND next_attempt_at <= NOW())
                   OR
                   (status = 'PROCESSING' AND claim_expires_at < NOW())
+              )
+              AND EXISTS (
+                  SELECT 1 FROM tenants t
+                  WHERE t.id = connection_commands.tenant_id
+                    AND t.status = 'ACTIVE'
               )
             ORDER BY created_at ASC
             LIMIT 1
@@ -88,16 +93,31 @@ class ConnectionCommandRepository {
 
         const candidate = selected.rows[0];
 
-        // If stale processing claim has exceeded max attempts, fail it instead of re-claiming
-        if (candidate.attempt_count >= candidate.max_attempts) {
-            await client.query(`
-                UPDATE connection_commands
-                SET status = 'FAILED',
-                    last_error = 'EXCEEDED_MAX_RETRIES',
-                    updated_at = NOW()
-                WHERE id = $1;
-            `, [candidate.id]);
-            return null;
+        // If candidate is a stale processing claim, classify by remote boundary
+        if (candidate.status === 'PROCESSING') {
+            if (candidate.remote_started_at) {
+                // Class B: Remote mutation was initiated. NEVER blind retry!
+                await client.query(`
+                    UPDATE connection_commands
+                    SET status = 'REMOTE_OUTCOME_UNKNOWN',
+                        last_error = 'CLAIM_EXPIRED_REMOTE_OUTCOME_UNKNOWN',
+                        updated_at = NOW()
+                    WHERE id = $1;
+                `, [candidate.id]);
+                return null;
+            }
+
+            // Class A: Remote mutation was never initiated
+            if (candidate.attempt_count >= candidate.max_attempts) {
+                await client.query(`
+                    UPDATE connection_commands
+                    SET status = 'FAILED',
+                        last_error = 'EXCEEDED_MAX_ATTEMPTS',
+                        updated_at = NOW()
+                    WHERE id = $1;
+                `, [candidate.id]);
+                return null;
+            }
         }
 
         const updateSql = `
@@ -119,6 +139,131 @@ class ConnectionCommandRepository {
     }
 
     /**
+     * Reaps expired processing commands according to Class A and Class B boundaries.
+     * Class A (remote_started_at IS NULL): safely resets to PENDING if attempts remain, or fails.
+     * Class B (remote_started_at IS NOT NULL): transitions to REMOTE_OUTCOME_UNKNOWN.
+     *
+     * @param {import('pg').PoolClient|import('pg').Pool} [dbClient]
+     * @param {object} [params]
+     * @param {string[]} [params.connectionIds]
+     * @returns {Promise<{ classARequeued: number, classAFailed: number, classBUnknown: number }>}
+     */
+    async reapStaleCommands(dbClient, { connectionIds = null } = {}) {
+        const client = dbClient || this.pool;
+        const connFilter = Array.isArray(connectionIds) && connectionIds.length > 0
+            ? 'AND connection_id = ANY($1)'
+            : '';
+        const params = Array.isArray(connectionIds) && connectionIds.length > 0 ? [connectionIds] : [];
+
+        // 1. Class A: Expired PROCESSING with attempts remaining and remote_started_at IS NULL -> PENDING
+        const classARequeueSql = `
+            UPDATE connection_commands
+            SET status = 'PENDING',
+                claimed_by_worker_id = NULL,
+                claim_epoch = NULL,
+                claim_expires_at = NULL,
+                next_attempt_at = NOW(),
+                updated_at = NOW()
+            WHERE status = 'PROCESSING'
+              AND claim_expires_at < NOW()
+              AND remote_started_at IS NULL
+              AND attempt_count < max_attempts
+              ${connFilter}
+            RETURNING id;
+        `;
+        const resA = await client.query(classARequeueSql, params);
+
+        // 2. Class A Terminal: Expired PROCESSING with attempts exhausted and remote_started_at IS NULL -> FAILED
+        const classAFailSql = `
+            UPDATE connection_commands
+            SET status = 'FAILED',
+                last_error = 'EXCEEDED_MAX_ATTEMPTS',
+                updated_at = NOW()
+            WHERE status = 'PROCESSING'
+              AND claim_expires_at < NOW()
+              AND remote_started_at IS NULL
+              AND attempt_count >= max_attempts
+              ${connFilter}
+            RETURNING id;
+        `;
+        const resAFail = await client.query(classAFailSql, params);
+
+        // 3. Class B: Expired PROCESSING with remote_started_at IS NOT NULL -> REMOTE_OUTCOME_UNKNOWN
+        const classBSql = `
+            UPDATE connection_commands
+            SET status = 'REMOTE_OUTCOME_UNKNOWN',
+                last_error = 'CLAIM_EXPIRED_REMOTE_OUTCOME_UNKNOWN',
+                updated_at = NOW()
+            WHERE status = 'PROCESSING'
+              AND claim_expires_at < NOW()
+              AND remote_started_at IS NOT NULL
+              ${connFilter}
+            RETURNING id;
+        `;
+        const resB = await client.query(classBSql, params);
+
+        return {
+            classARequeued: resA.rows.length,
+            classAFailed: resAFail.rows.length,
+            classBUnknown: resB.rows.length,
+        };
+    }
+
+    /**
+     * Finds a command by ID across the platform.
+     */
+    async findById(id, dbClient = null) {
+        if (!id) return null;
+        const client = dbClient || this.pool;
+        const sql = `
+            SELECT id, tenant_id, connection_id, group_id, command_type, payload,
+                   status, attempt_count, max_attempts, last_attempt_at, next_attempt_at,
+                   claimed_by_worker_id, claim_epoch, claim_expires_at,
+                   remote_started_at, executed_at, result, last_error, created_at, updated_at
+            FROM connection_commands
+            WHERE id = $1;
+        `;
+        const { rows } = await client.query(sql, [id]);
+        return rows[0] || null;
+    }
+
+    /**
+     * Finds commands for a connection with status REMOTE_OUTCOME_UNKNOWN eligible for verification.
+     */
+    async findUnknownCommandsForConnection(dbClient, connectionId) {
+        const client = dbClient || this.pool;
+        const sql = `
+            SELECT * FROM connection_commands
+            WHERE connection_id = $1 AND status = 'REMOTE_OUTCOME_UNKNOWN'
+              AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+            ORDER BY created_at ASC;
+        `;
+        const { rows } = await client.query(sql, [connectionId]);
+        return rows;
+    }
+
+    /**
+     * Atomically records a transient verification attempt for a command in REMOTE_OUTCOME_UNKNOWN.
+     * Keeps status as REMOTE_OUTCOME_UNKNOWN and schedules next verification attempt.
+     */
+    async recordUnknownVerificationAttempt(dbClient, { id, workerId, claimEpoch, error = null, backoffSeconds = 10 }) {
+        const client = dbClient || this.pool;
+        const sql = `
+            UPDATE connection_commands
+            SET attempt_count = attempt_count + 1,
+                last_error = $4,
+                next_attempt_at = NOW() + ($5 || ' seconds')::interval,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'REMOTE_OUTCOME_UNKNOWN'
+              AND EXISTS (SELECT 1 FROM whatsapp_connections c WHERE c.id = connection_commands.connection_id AND c.assigned_worker_id = $2 AND c.lease_epoch = $3 AND c.lease_expires_at > NOW())
+            RETURNING id, attempt_count, next_attempt_at;
+        `;
+        const { rows } = await client.query(sql, [id, workerId, claimEpoch, error, backoffSeconds]);
+        return rows.length === 1;
+    }
+
+    /**
      * Atomically marks a command COMPLETED, fenced by workerId and claimEpoch.
      * @returns {Promise<boolean>} True if 1 row updated, false if lost claim
      */
@@ -131,9 +276,15 @@ class ConnectionCommandRepository {
                 result = $4,
                 updated_at = NOW()
             WHERE id = $1
-              AND status = 'PROCESSING'
-              AND claimed_by_worker_id = $2
-              AND claim_epoch = $3
+              AND status IN ('PROCESSING', 'REMOTE_OUTCOME_UNKNOWN')
+              AND (
+                  (status = 'PROCESSING' AND claimed_by_worker_id = $2 AND claim_epoch = $3)
+                  OR
+                  (status = 'REMOTE_OUTCOME_UNKNOWN')
+              )
+              AND EXISTS (SELECT 1 FROM whatsapp_connections c
+                WHERE c.id = connection_commands.connection_id AND c.assigned_worker_id = $2
+                  AND c.lease_epoch = $3 AND c.lease_expires_at > NOW())
             RETURNING id;
         `;
         const { rows } = await client.query(sql, [id, workerId, claimEpoch, JSON.stringify(result)]);
@@ -141,9 +292,9 @@ class ConnectionCommandRepository {
     }
 
     /**
-     * Claim-fenced stale-generation requeue (Correction 2).
-     * Only succeeds if the worker still holds the exact claim.
-     * @returns {Promise<boolean>} True if 1 row updated, false if lost claim
+     * Claim-fenced stale-generation requeue.
+     * Strictly rejects requeueing mutating commands where remote_started_at IS NOT NULL.
+     * @returns {Promise<boolean>} True if 1 row updated, false if lost claim or prohibited
      */
     async requeueStaleCommand(dbClient, { id, workerId, claimEpoch }) {
         const client = dbClient || this.pool;
@@ -156,9 +307,14 @@ class ConnectionCommandRepository {
                 next_attempt_at = NOW(),
                 updated_at = NOW()
             WHERE id = $1
-              AND status = 'PROCESSING'
-              AND claimed_by_worker_id = $2
-              AND claim_epoch = $3
+              AND status IN ('PROCESSING', 'REMOTE_OUTCOME_UNKNOWN')
+              AND (remote_started_at IS NULL OR command_type = 'SYNC_GROUPS')
+              AND (
+                  (status = 'PROCESSING' AND claimed_by_worker_id = $2 AND claim_epoch = $3)
+                  OR
+                  (status = 'REMOTE_OUTCOME_UNKNOWN')
+              )
+              AND EXISTS (SELECT 1 FROM whatsapp_connections c WHERE c.id = connection_commands.connection_id AND c.assigned_worker_id = $2 AND c.lease_epoch = $3 AND c.lease_expires_at > NOW())
             RETURNING id;
         `;
         const { rows } = await client.query(sql, [id, workerId, claimEpoch]);
@@ -180,9 +336,13 @@ class ConnectionCommandRepository {
                     last_error = $4,
                     updated_at = NOW()
                 WHERE id = $1
-                  AND status = 'PROCESSING'
-                  AND claimed_by_worker_id = $2
-                  AND claim_epoch = $3
+                  AND status IN ('PROCESSING', 'REMOTE_OUTCOME_UNKNOWN')
+                  AND (
+                      (status = 'PROCESSING' AND claimed_by_worker_id = $2 AND claim_epoch = $3)
+                      OR
+                      (status = 'REMOTE_OUTCOME_UNKNOWN')
+                  )
+                  AND EXISTS (SELECT 1 FROM whatsapp_connections c WHERE c.id = connection_commands.connection_id AND c.assigned_worker_id = $2 AND c.lease_epoch = $3 AND c.lease_expires_at > NOW())
                 RETURNING id;
             `;
             const { rows } = await client.query(terminalSql, [id, workerId, claimEpoch, error]);
@@ -203,13 +363,46 @@ class ConnectionCommandRepository {
                 last_error = $4,
                 updated_at = NOW()
             WHERE id = $1
-              AND status = 'PROCESSING'
-              AND claimed_by_worker_id = $2
-              AND claim_epoch = $3
+              AND status IN ('PROCESSING', 'REMOTE_OUTCOME_UNKNOWN')
+              AND (
+                  (status = 'PROCESSING' AND claimed_by_worker_id = $2 AND claim_epoch = $3)
+                  OR
+                  (status = 'REMOTE_OUTCOME_UNKNOWN')
+              )
+              AND EXISTS (SELECT 1 FROM whatsapp_connections c WHERE c.id = connection_commands.connection_id AND c.assigned_worker_id = $2 AND c.lease_epoch = $3 AND c.lease_expires_at > NOW())
             RETURNING id, status;
         `;
         const { rows } = await client.query(retrySql, [id, workerId, claimEpoch, error, backoffSeconds]);
+        if (rows.length === 0) return false;
+        return rows[0].status === 'FAILED' ? 'FAILED' : true;
+    }
+
+    async markRemoteOutcomeUnknown(dbClient, { id, workerId, claimEpoch, error = 'REMOTE_OUTCOME_UNKNOWN' }) {
+        const client = dbClient || this.pool;
+        const sql = `UPDATE connection_commands SET status = 'REMOTE_OUTCOME_UNKNOWN', last_error = $4, updated_at = NOW()
+          WHERE id = $1 AND status = 'PROCESSING' AND claimed_by_worker_id = $2 AND claim_epoch = $3
+            AND EXISTS (SELECT 1 FROM whatsapp_connections c WHERE c.id = connection_commands.connection_id
+              AND c.assigned_worker_id = $2 AND c.lease_epoch = $3 AND c.lease_expires_at > NOW()) RETURNING id;`;
+        const { rows } = await client.query(sql, [id, workerId, claimEpoch, error]);
         return rows.length === 1;
+    }
+
+    async markRemoteStarted(dbClient, { id, workerId, claimEpoch }) {
+        const client = dbClient || this.pool;
+        const sql = `UPDATE connection_commands SET remote_started_at = COALESCE(remote_started_at, NOW()), updated_at = NOW()
+          WHERE id = $1 AND status = 'PROCESSING' AND claimed_by_worker_id = $2 AND claim_epoch = $3
+            AND EXISTS (SELECT 1 FROM whatsapp_connections c WHERE c.id = connection_commands.connection_id
+              AND c.assigned_worker_id = $2 AND c.lease_epoch = $3 AND c.lease_expires_at > NOW()) RETURNING id;`;
+        const { rows } = await client.query(sql, [id, workerId, claimEpoch]);
+        return rows.length === 1;
+    }
+
+    async markRemoteStartedUnknownForWorker(dbClient, { workerId }) {
+        const client = dbClient || this.pool;
+        const sql = `UPDATE connection_commands SET status = 'REMOTE_OUTCOME_UNKNOWN', last_error = 'DRAIN_GRACE_EXPIRED', updated_at = NOW()
+          WHERE status = 'PROCESSING' AND claimed_by_worker_id = $1 AND remote_started_at IS NOT NULL RETURNING id;`;
+        const { rows } = await client.query(sql, [workerId]);
+        return rows.length;
     }
 }
 

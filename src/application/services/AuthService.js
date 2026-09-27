@@ -14,8 +14,21 @@ class AuthService {
      * @param {import('./PasswordService')} params.passwordService
      * @param {import('./TokenService')} params.tokenService
      * @param {import('pg').Pool} params.pool
+     * @param {import('../../repositories/TenantRepository')} [params.tenantRepo]
+     * @param {import('../../repositories/TenantMembershipRepository')} [params.tenantMembershipRepo]
+     * @param {import('../../repositories/PlatformRoleRepository')} [params.platformRoleRepo]
      */
-    constructor({ userRepo, refreshTokenRepo, auditLogRepo = null, passwordService, tokenService, pool }) {
+    constructor({
+        userRepo,
+        refreshTokenRepo,
+        auditLogRepo = null,
+        passwordService,
+        tokenService,
+        pool,
+        tenantRepo = null,
+        tenantMembershipRepo = null,
+        platformRoleRepo = null,
+    }) {
         if (!userRepo || !refreshTokenRepo || !passwordService || !tokenService || !pool) {
             throw new Error('[AuthService] userRepo, refreshTokenRepo, passwordService, tokenService, and pool are required');
         }
@@ -26,6 +39,36 @@ class AuthService {
         this.passwordService = passwordService;
         this.tokenService = tokenService;
         this.pool = pool;
+        this.tenantRepo = tenantRepo;
+        this.tenantMembershipRepo = tenantMembershipRepo;
+        this.platformRoleRepo = platformRoleRepo;
+    }
+
+    /**
+     * Tanzanian phone number validation & normalization.
+     * Expected form: +255XXXXXXXXX (E.164 Tanzanian mobile).
+     * Accepts:
+     *   +2557XXXXXXXX, +2556XXXXXXXX (13 chars)
+     *   2557XXXXXXXX, 2556XXXXXXXX   (12 digits) -> +255...
+     *   07XXXXXXXX, 06XXXXXXXX       (10 digits) -> +255...
+     * Rejects arbitrary invalid strings.
+     *
+     * @param {string} phone
+     * @returns {string|null} Normalized E.164 phone or null if invalid
+     */
+    static normalizePhoneNumber(phone) {
+        if (!phone || typeof phone !== 'string') return null;
+        const cleaned = phone.trim().replace(/[\s\-()]/g, '');
+        if (/^\+255[67]\d{8}$/.test(cleaned)) {
+            return cleaned;
+        }
+        if (/^255[67]\d{8}$/.test(cleaned)) {
+            return `+${cleaned}`;
+        }
+        if (/^0[67]\d{8}$/.test(cleaned)) {
+            return `+255${cleaned.slice(1)}`;
+        }
+        return null;
     }
 
     /**
@@ -40,31 +83,51 @@ class AuthService {
     }
 
     /**
-     * User registration with password policy check, Argon2id hashing, and transactional creation.
+     * Customer User registration with atomic provisioning:
+     * User (CUSTOMER) + Tenant (Customer <safeId>) + OWNER Membership.
+     * Single transaction, full rollback on any failure.
      *
      * @param {object} params
      * @param {string} params.email
      * @param {string} params.password
+     * @param {string} [params.phoneNumber]
      * @param {string} [params.ipAddress]
      * @param {string} [params.userAgent]
-     * @returns {Promise<{ user: object }>} Safe user representation
+     * @returns {Promise<{ user: object, tenant?: object }>}
      */
-    async register({ email, password, ipAddress = null, userAgent = null }) {
-        if (!AuthService.isValidEmail(email)) {
+    async register({ email, password, phoneNumber = null, ipAddress = null, userAgent = null }) {
+        let cleanPhone = null;
+        if (phoneNumber) {
+            cleanPhone = AuthService.normalizePhoneNumber(phoneNumber);
+            if (!cleanPhone) {
+                throw new AuthError('A valid Tanzanian phone number (+255XXXXXXXXX) is required', 'VALIDATION_ERROR', 400);
+            }
+        }
+
+        if (!email || typeof email !== 'string' || !AuthService.isValidEmail(email)) {
             throw new AuthError('A valid email address is required', 'VALIDATION_ERROR', 400);
         }
 
         const normalizedEmail = email.trim().toLowerCase();
 
         // 1. Password policy verification
+        if (!password || typeof password !== 'string') {
+            throw new AuthError('Password is required', 'VALIDATION_ERROR', 400);
+        }
         const policy = this.passwordService.validatePolicy(password);
         if (!policy.valid) {
             throw new AuthError(policy.error || 'Password does not meet security requirements', 'WEAK_PASSWORD', 400);
         }
 
-        // 2. Check for duplicate email (case-insensitive)
-        const existing = await this.userRepo.findByEmail(normalizedEmail);
-        if (existing) {
+        // 2. Check for duplicate phone or email (case-insensitive)
+        if (cleanPhone) {
+            const existingPhone = await this.userRepo.findByPhoneNumber(cleanPhone);
+            if (existingPhone) {
+                throw new AuthError('An account with this phone number already exists', 'PHONE_ALREADY_EXISTS', 409);
+            }
+        }
+        const existingEmail = await this.userRepo.findByEmail(normalizedEmail);
+        if (existingEmail) {
             throw new AuthError('An account with this email address already exists', 'EMAIL_ALREADY_EXISTS', 409);
         }
 
@@ -76,15 +139,48 @@ class AuthService {
         try {
             await client.query('BEGIN');
 
-            const user = await this.userRepo.create({ email: normalizedEmail, passwordHash }, client);
+            const user = await this.userRepo.create({
+                email: normalizedEmail,
+                passwordHash,
+                phoneNumber: cleanPhone,
+            }, client);
+
+            let tenant = null;
+            let membership = null;
+            if (this.tenantRepo && this.tenantMembershipRepo) {
+                const safeId = user.id.replace(/-/g, '').slice(0, 8).toUpperCase();
+                const tenantName = `Customer ${safeId}`;
+                tenant = await this.tenantRepo.create({
+                    name: tenantName,
+                    status: 'ACTIVE',
+                }, client);
+
+                membership = await this.tenantMembershipRepo.create({
+                    tenantId: tenant.id,
+                    userId: user.id,
+                    role: 'OWNER',
+                }, client);
+            }
+
+            if (this.platformRoleRepo) {
+                await this.platformRoleRepo.assignRole({
+                    userId: user.id,
+                    role: 'CUSTOMER',
+                }, client);
+            }
 
             if (this.auditLogRepo) {
                 await this.auditLogRepo.create({
+                    tenantId: tenant ? tenant.id : null,
                     actorUserId: user.id,
-                    action: 'USER_REGISTERED',
+                    action: tenant ? 'CUSTOMER_REGISTERED' : 'USER_REGISTERED',
                     resourceType: 'USER',
                     resourceId: user.id,
-                    metadata: { email: normalizedEmail },
+                    metadata: {
+                        email: normalizedEmail,
+                        phoneNumber: cleanPhone,
+                        tenantId: tenant ? tenant.id : null,
+                    },
                     ipAddress,
                     userAgent,
                 }, client);
@@ -96,13 +192,23 @@ class AuthService {
                 user: {
                     id: user.id,
                     email: user.email,
+                    phoneNumber: user.phone_number,
+                    role: 'CUSTOMER',
                     createdAt: user.created_at,
                 },
+                tenant: tenant ? {
+                    id: tenant.id,
+                    name: tenant.name,
+                    status: tenant.status,
+                } : null,
             };
         } catch (err) {
             await client.query('ROLLBACK');
             // Check for unique constraint violation race condition
             if (err.code === '23505') {
+                if (err.detail && err.detail.includes('phone_number')) {
+                    throw new AuthError('An account with this phone number already exists', 'PHONE_ALREADY_EXISTS', 409);
+                }
                 throw new AuthError('An account with this email address already exists', 'EMAIL_ALREADY_EXISTS', 409);
             }
             throw err;
@@ -113,20 +219,49 @@ class AuthService {
 
     /**
      * User login with constant-time password check, JWT generation, and opaque refresh token issuance.
+     * Strictly requires EMAIL and PASSWORD. Phone number login is PROHIBITED.
      *
      * @param {object} params
-     * @param {string} params.email
+     * @param {string} [params.email]
+     * @param {string} [params.phoneNumber]
+     * @param {string} [params.identifier]
      * @param {string} params.password
      * @param {string} [params.ipAddress]
      * @param {string} [params.userAgent]
      * @returns {Promise<{ user: object, accessToken: string, refreshToken: string }>}
      */
-    async login({ email, password, ipAddress = null, userAgent = null }) {
-        if (!email || !password || typeof email !== 'string' || typeof password !== 'string') {
+    async login({ email, phoneNumber, identifier, password, ipAddress = null, userAgent = null }) {
+        // Enforce: Phone number is strictly prohibited as a login identifier
+        if (!email && (identifier || phoneNumber)) {
+            // Mitigate timing attack
+            await this.passwordService.verify(
+                '$argon2id$v=19$m=4096,t=1,p=1$dummySaltForTiming$dummyHashForConstantTimeVerification12345678',
+                password || 'dummy'
+            ).catch(() => {});
+
+            if (this.auditLogRepo) {
+                await this.auditLogRepo.create({
+                    action: 'LOGIN_FAILED',
+                    resourceType: 'USER',
+                    metadata: { reason: 'phone_login_prohibited', identifier: identifier || phoneNumber },
+                    ipAddress,
+                    userAgent,
+                }).catch(() => {});
+            }
+
+            throw new AuthError('Phone number login is not permitted. Please log in with your email address.', 'INVALID_CREDENTIALS', 401);
+        }
+
+        if (!email || typeof email !== 'string' || !password || typeof password !== 'string') {
+            throw new AuthError('Email and password are required', 'INVALID_CREDENTIALS', 401);
+        }
+
+        const trimmedEmail = email.trim();
+        if (!AuthService.isValidEmail(trimmedEmail)) {
             throw new AuthError('Invalid email or password', 'INVALID_CREDENTIALS', 401);
         }
 
-        const normalizedEmail = email.trim().toLowerCase();
+        const normalizedEmail = trimmedEmail.toLowerCase();
         const user = await this.userRepo.findByEmail(normalizedEmail);
 
         if (!user || !user.password_hash) {
@@ -166,10 +301,28 @@ class AuthService {
             throw new AuthError('Invalid email or password', 'INVALID_CREDENTIALS', 401);
         }
 
+        // Resolve user's tenant and platform role
+        let primaryTenantId = null;
+        if (this.tenantMembershipRepo) {
+            const memberships = await this.tenantMembershipRepo.listTenantsForUser(user.id);
+            const ownerMembership = memberships.find((m) => m.role === 'OWNER');
+            primaryTenantId = ownerMembership ? ownerMembership.tenant_id : (memberships[0]?.tenant_id || null);
+        }
+
+        let platformRoles = [];
+        if (this.platformRoleRepo) {
+            platformRoles = await this.platformRoleRepo.findRolesByUserId(user.id);
+        }
+        const effectiveRole = platformRoles.includes('ADMIN') ? 'ADMIN' : 'CUSTOMER';
+
         // 1. Create short-lived Access Token (15m JWT)
         const accessToken = this.tokenService.createAccessToken({
             userId: user.id,
             email: user.email,
+            extraClaims: {
+                tenantId: primaryTenantId,
+                role: effectiveRole,
+            },
         });
 
         // 2. Generate opaque Refresh Token (32 bytes) and persist SHA-256 hash
@@ -188,10 +341,11 @@ class AuthService {
         if (this.auditLogRepo) {
             await this.auditLogRepo.create({
                 actorUserId: user.id,
+                tenantId: primaryTenantId,
                 action: 'LOGIN_SUCCEEDED',
                 resourceType: 'USER',
                 resourceId: user.id,
-                metadata: { familyId },
+                metadata: { familyId, role: effectiveRole, tenantId: primaryTenantId },
                 ipAddress,
                 userAgent,
             }).catch(() => {});
@@ -201,6 +355,9 @@ class AuthService {
             user: {
                 id: user.id,
                 email: user.email,
+                phoneNumber: user.phone_number,
+                role: effectiveRole,
+                tenantId: primaryTenantId,
                 createdAt: user.created_at,
             },
             accessToken,
@@ -379,9 +536,39 @@ class AuthService {
             throw new AuthError('User account not found', 'USER_NOT_FOUND', 404);
         }
 
+        let tenant = null;
+        if (this.tenantMembershipRepo) {
+            const memberships = await this.tenantMembershipRepo.listTenantsForUser(user.id);
+            const ownerMembership = memberships.find((m) => m.role === 'OWNER');
+            const primary = ownerMembership || memberships[0] || null;
+            if (primary) {
+                tenant = {
+                    id: primary.tenant_id,
+                    name: primary.tenant_name,
+                    status: primary.tenant_status || 'ACTIVE',
+                    role: primary.role,
+                };
+            }
+        }
+
+        let role = 'CUSTOMER';
+        if (this.platformRoleRepo) {
+            const roles = await this.platformRoleRepo.findRolesByUserId(user.id);
+            role = roles.includes('ADMIN') ? 'ADMIN' : 'CUSTOMER';
+        }
+
         return {
             id: user.id,
             email: user.email,
+            phoneNumber: user.phone_number,
+            role,
+            tenant,
+            user: {
+                id: user.id,
+                email: user.email,
+                phoneNumber: user.phone_number,
+                role,
+            },
             createdAt: user.created_at,
             updatedAt: user.updated_at,
         };

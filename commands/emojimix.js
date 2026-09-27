@@ -1,6 +1,6 @@
 const fetch = require('node-fetch');
 const fs = require('fs');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const path = require('path');
 
 async function emojimixCommand(sock, chatId, msg) {
@@ -56,11 +56,15 @@ async function emojimixCommand(sock, chatId, msg) {
         const buffer = await imageResponse.buffer();
         fs.writeFileSync(tempFile, buffer);
 
-        // Convert to WebP using ffmpeg with proper path escaping
-        const ffmpegCommand = `ffmpeg -i "${tempFile}" -vf "scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000" "${outputFile}"`;
+        // Convert to WebP using ffmpeg
+        const ffmpegArgs = [
+            '-i', tempFile,
+            '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000',
+            outputFile
+        ];
         
         await new Promise((resolve, reject) => {
-            exec(ffmpegCommand, (error) => {
+            execFile('ffmpeg', ffmpegArgs, (error) => {
                 if (error) {
                     console.error('FFmpeg error:', error);
                     reject(error);

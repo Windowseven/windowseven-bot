@@ -1,5 +1,7 @@
 const NormalizedMessage = require('../../domain/models/NormalizedMessage');
 const ApplicationContext = require('../context/ApplicationContext');
+const TenantRepository = require('../../repositories/TenantRepository');
+const SubscriptionRepository = require('../../repositories/SubscriptionRepository');
 
 class ApplicationPipeline {
     /**
@@ -12,6 +14,11 @@ class ApplicationPipeline {
      * @param {import('../policies/PolicyEngine')} params.policyEngine
      * @param {import('../commands/CommandRegistry')} params.commandRegistry
      * @param {import('../../gateways/WhatsAppModerationGateway')} params.gateway
+     * @param {import('../../repositories/TenantRepository')} [params.tenantRepo]
+     * @param {import('../../repositories/SubscriptionRepository')} [params.subscriptionRepo]
+     * @param {import('../../repositories/ConnectionCommandRepository')} [params.commandRepo]
+     * @param {object} [params.commandGateway]
+     * @param {boolean} [params.enforceSubscription]
      */
     constructor({
         groupRepo,
@@ -22,6 +29,11 @@ class ApplicationPipeline {
         policyEngine,
         commandRegistry,
         gateway,
+        tenantRepo = null,
+        subscriptionRepo = null,
+        commandRepo = null,
+        commandGateway = null,
+        enforceSubscription = false,
     }) {
         if (!groupRepo || !policyRepo || !warningService || !moderationService || !policyEngine || !commandRegistry || !gateway) {
             throw new Error('[ApplicationPipeline] All repositories, services, and gateways are required');
@@ -35,6 +47,11 @@ class ApplicationPipeline {
         this.policyEngine = policyEngine;
         this.commandRegistry = commandRegistry;
         this.gateway = gateway;
+        this.tenantRepo = tenantRepo || (this.groupRepo?.pool ? new TenantRepository(this.groupRepo.pool) : null);
+        this.subscriptionRepo = subscriptionRepo || (this.groupRepo?.pool ? new SubscriptionRepository(this.groupRepo.pool) : null);
+        this.commandRepo = commandRepo;
+        this.commandGateway = commandGateway;
+        this.enforceSubscription = enforceSubscription;
 
         // Bundle services for command execution
         this.services = {
@@ -43,6 +60,8 @@ class ApplicationPipeline {
             warningRepo: this.warningRepo,
             warningService: this.warningService,
             moderationService: this.moderationService,
+            commandRepo: this.commandRepo,
+            commandGateway: this.commandGateway,
         };
     }
 
@@ -68,24 +87,37 @@ class ApplicationPipeline {
                 return { handled: false, reason: 'not_group' };
             }
 
-            // 2. Tenant + Connection Scoped Group Resolution
+            // 2. Tenant Lifecycle Enforcement Gate
+            let tenant = null;
+            if (this.tenantRepo) {
+                tenant = await this.tenantRepo.findById(tenantId);
+                if (!tenant) {
+                    return { handled: false, reason: 'tenant_not_found' };
+                }
+                // DEACTIVATED: Sockets are torn down; drop all incoming events fail-closed
+                if (tenant.status === 'DEACTIVATED') {
+                    return { handled: false, reason: 'tenant_deactivated' };
+                }
+            }
+
+            // 3. Tenant + Connection Scoped Group Resolution
             const group = await this.groupRepo.findByJidForTenant(message.remoteJid, tenantId);
             if (!group || group.connection_id !== connectionId) {
                 return { handled: false, reason: 'unresolved_or_mismatched_group' };
             }
 
-            // 3. Managed Group Gate (Mandatory: Only MANAGED groups run policies/moderation)
+            // 4. Managed Group Gate (Mandatory: Only MANAGED groups run policies/moderation)
             if (group.status !== 'MANAGED') {
                 return { handled: false, reason: 'group_not_managed' };
             }
 
-            // 4. Actor Resolution (WhatsApp group privileges)
+            // 5. Actor Resolution (WhatsApp group privileges)
             const { isSenderAdmin, isBotAdmin } = await this.gateway.checkAdminStatus(
                 message.remoteJid,
                 message.sender
             );
 
-            // 5. Build NormalizedMessage & ApplicationContext
+            // 6. Build NormalizedMessage & ApplicationContext (Event Observability & Normalization)
             const normalizedMsg = new NormalizedMessage({
                 messageId: message.id,
                 tenantId,
@@ -114,8 +146,37 @@ class ApplicationPipeline {
                 message: normalizedMsg,
             });
 
-            // 6. Command Processing
+            // 7. SUSPENDED Tenant Runtime Enforcement:
+            // Sockets remain alive and incoming events are observed/normalized above,
+            // but all bot chat commands, moderation mutations, and automated policy actions are suppressed.
+            if (tenant && tenant.status === 'SUSPENDED') {
+                return {
+                    handled: true,
+                    reason: 'tenant_suspended',
+                    messageKind: normalizedMsg.messageKind,
+                    message: normalizedMsg,
+                    appCtx,
+                };
+            }
+
+            // 8. Command Processing
             if (normalizedMsg.messageKind === 'COMMAND') {
+                // Subscription Expiry Gate:
+                // Sockets remain connected and messages processed, but commands stop working with renewal prompt.
+                if (this.subscriptionRepo) {
+                    const latestSub = await this.subscriptionRepo.findLatestByTenantId(tenantId);
+                    if (latestSub || this.enforceSubscription) {
+                        const activeSub = await this.subscriptionRepo.findActiveByTenantId(tenantId);
+                        if (!activeSub) {
+                            await this.moderationService.sendMessage(
+                                appCtx,
+                                '⚠️ Your Windowseven subscription has expired. Please renew your subscription to continue using bot commands.'
+                            );
+                            return { handled: true, reason: 'subscription_expired' };
+                        }
+                    }
+                }
+
                 const handler = this.commandRegistry.find(normalizedMsg.command);
                 if (handler) {
                     // Authorization Gate

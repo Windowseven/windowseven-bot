@@ -15,6 +15,15 @@ class GroupSynchronizer {
         this.auditLogRepo = auditLogRepo;
     }
 
+    async _upsert(ctx, group, expectedEpoch = null) {
+        if (ctx.workerId && (ctx.leaseEpoch ?? expectedEpoch) !== null) {
+            return this.groupRepo.upsertDiscoveredGroupForWorker(ctx.tenantId, ctx.connectionId, group, {
+                workerId: ctx.workerId, leaseEpoch: ctx.leaseEpoch ?? expectedEpoch,
+            });
+        }
+        return this.groupRepo.upsertDiscoveredGroup(ctx.tenantId, ctx.connectionId, group);
+    }
+
     /**
      * Synchronizes all currently participating WhatsApp groups for the connection into PostgreSQL.
      * Generation-fenced: If the worker loses its lease during synchronization, it immediately aborts
@@ -73,11 +82,12 @@ class GroupSynchronizer {
 
                 const name = meta?.subject || null;
                 try {
-                    await this.groupRepo.upsertDiscoveredGroup(ctx.tenantId, ctx.connectionId, {
+                    const saved = await this._upsert(ctx, {
                         whatsappJid: jid,
                         name,
                         status: 'DISCOVERED',
-                    });
+                    }, expectedEpoch);
+                    if (!saved) return { success: false, syncedCount: count, error: 'stale_generation' };
                     count++;
                 } catch (dbErr) {
                     console.error(
@@ -107,7 +117,7 @@ class GroupSynchronizer {
             const { jid, name } = event.group;
             if (!jid || !jid.endsWith('@g.us')) return;
 
-            await this.groupRepo.upsertDiscoveredGroup(ctx.tenantId, ctx.connectionId, {
+            await this._upsert(ctx, {
                 whatsappJid: jid,
                 name: name || null,
                 status: 'DISCOVERED',
@@ -125,7 +135,7 @@ class GroupSynchronizer {
             const { jid, name } = event.group;
             if (!jid || !jid.endsWith('@g.us')) return;
 
-            await this.groupRepo.upsertDiscoveredGroup(ctx.tenantId, ctx.connectionId, {
+            await this._upsert(ctx, {
                 whatsappJid: jid,
                 name: name || null,
                 status: 'DISCOVERED',
@@ -162,7 +172,11 @@ class GroupSynchronizer {
                 console.log(`[GroupSynchronizer ${ctx.tenantId}:${ctx.connectionId}] Bot was removed from ${group.jid}. Marking UNMANAGED.`);
                 const foundGroup = await this.groupRepo.findByJidForTenant(group.jid, ctx.tenantId);
                 if (foundGroup) {
-                    await this.groupRepo.updateStatusForTenant(foundGroup.id, ctx.tenantId, 'UNMANAGED');
+                    if (ctx.workerId && ctx.leaseEpoch !== null) {
+                        await this.groupRepo.updateStatusForWorker(foundGroup.id, ctx.tenantId, 'UNMANAGED', { workerId: ctx.workerId, leaseEpoch: ctx.leaseEpoch });
+                    } else {
+                        await this.groupRepo.updateStatusForTenant(foundGroup.id, ctx.tenantId, 'UNMANAGED');
+                    }
                 }
             }
         } catch (err) {

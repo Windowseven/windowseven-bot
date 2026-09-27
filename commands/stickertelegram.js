@@ -6,7 +6,7 @@ const path = require('path');
 const sharp = require('sharp');
 const webp = require('node-webpmux');
 const crypto = require('crypto');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const settings = require('../settings');
 
 async function stickerTelegramCommand(sock, chatId, msg) {
@@ -105,12 +105,12 @@ async function stickerTelegramCommand(sock, chatId, msg) {
                     const isAnimated = sticker.is_animated || sticker.is_video;
                     
                     // Convert to WebP using ffmpeg with optimized settings
-                    const ffmpegCommand = isAnimated
-                        ? `ffmpeg -i "${tempInput}" -vf "scale=512:512:force_original_aspect_ratio=decrease,fps=15,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 75 -compression_level 6 "${tempOutput}"`
-                        : `ffmpeg -i "${tempInput}" -vf "scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 75 -compression_level 6 "${tempOutput}"`;
+                    const ffmpegArgs = isAnimated
+                        ? ['-i', tempInput, '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,fps=15,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000', '-c:v', 'libwebp', '-preset', 'default', '-loop', '0', '-vsync', '0', '-pix_fmt', 'yuva420p', '-quality', '75', '-compression_level', '6', tempOutput]
+                        : ['-i', tempInput, '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000', '-c:v', 'libwebp', '-preset', 'default', '-loop', '0', '-vsync', '0', '-pix_fmt', 'yuva420p', '-quality', '75', '-compression_level', '6', tempOutput];
 
                     await new Promise((resolve, reject) => {
-                        exec(ffmpegCommand, (error) => {
+                        execFile('ffmpeg', ffmpegArgs, (error) => {
                             if (error) {
                                 console.error('FFmpeg error:', error);
                                 reject(error);

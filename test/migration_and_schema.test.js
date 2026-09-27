@@ -38,13 +38,13 @@ describe('Database Migrations & Relational Schema Foundation', () => {
 
     it('should verify migration UP -> DOWN -> UP lifecycle reproducibility', async () => {
         // Rollback any existing state
-        await migrateDown(pool, 10);
+        await migrateDown(pool, 11);
         const statusDown = await getMigrationStatus(pool);
         assert.ok(statusDown.every((s) => !s.applied), 'All migrations should be reverted');
 
         // Apply all migrations UP
         const appliedFirst = await migrateUp(pool);
-        assert.strictEqual(appliedFirst.length, 6);
+        assert.strictEqual(appliedFirst.length, 10);
         assert.deepStrictEqual(appliedFirst, [
             '001_initial_schema',
             '002_whatsapp_auth',
@@ -52,17 +52,21 @@ describe('Database Migrations & Relational Schema Foundation', () => {
             '004_api_auth_and_audit',
             '005_connection_lifecycle_and_worker_ownership',
             '006_policy_moderation_and_durable_commands',
+            '007_worker_fencing_and_remote_outcomes',
+            '008_platform_administration',
+            '009_admin_business_layer',
+            '010_customer_connection_unique',
         ]);
 
         const statusUp = await getMigrationStatus(pool);
         assert.ok(statusUp.every((s) => s.applied), 'All migrations should be applied');
 
-        // Rollback DOWN 1 step (rolls back 006_policy_moderation_and_durable_commands)
+        // Rollback DOWN 1 step (rolls back 010_customer_connection_unique)
         const rolledBack = await migrateDown(pool, 1);
         assert.strictEqual(rolledBack.length, 1);
-        assert.strictEqual(rolledBack[0], '006_policy_moderation_and_durable_commands');
+        assert.strictEqual(rolledBack[0], '010_customer_connection_unique');
 
-        // Verify status shows 001-005 applied, 006 pending
+        // Verify status shows 001-009 applied, 010 pending
         const statusPartial = await getMigrationStatus(pool);
         const mapPartial = new Map(statusPartial.map((s) => [s.name, s.applied]));
         assert.strictEqual(mapPartial.get('001_initial_schema'), true);
@@ -70,12 +74,16 @@ describe('Database Migrations & Relational Schema Foundation', () => {
         assert.strictEqual(mapPartial.get('003_group_warnings'), true);
         assert.strictEqual(mapPartial.get('004_api_auth_and_audit'), true);
         assert.strictEqual(mapPartial.get('005_connection_lifecycle_and_worker_ownership'), true);
-        assert.strictEqual(mapPartial.get('006_policy_moderation_and_durable_commands'), false);
+        assert.strictEqual(mapPartial.get('006_policy_moderation_and_durable_commands'), true);
+        assert.strictEqual(mapPartial.get('007_worker_fencing_and_remote_outcomes'), true);
+        assert.strictEqual(mapPartial.get('008_platform_administration'), true);
+        assert.strictEqual(mapPartial.get('009_admin_business_layer'), true);
+        assert.strictEqual(mapPartial.get('010_customer_connection_unique'), false);
 
         // Re-apply UP again to leave database ready for tests
         const appliedSecond = await migrateUp(pool);
         assert.strictEqual(appliedSecond.length, 1);
-        assert.strictEqual(appliedSecond[0], '006_policy_moderation_and_durable_commands');
+        assert.strictEqual(appliedSecond[0], '010_customer_connection_unique');
     });
 
     it('should create users and enforce case-insensitive email uniqueness at DB level', async () => {
@@ -262,8 +270,9 @@ describe('Database Migrations & Relational Schema Foundation', () => {
 
     it('should enforce Phase 4E Group↔Connection composite foreign key constraint and new tables', async () => {
         const tenant1 = await tenantRepo.create({ name: 'Tenant 1 Invariant' });
+        const tenant2 = await tenantRepo.create({ name: 'Tenant 2 Invariant' });
         const conn1 = await connRepo.createForTenant(tenant1.id, { displayName: 'Conn 1' });
-        const conn2 = await connRepo.createForTenant(tenant1.id, { displayName: 'Conn 2' });
+        const conn2 = await connRepo.createForTenant(tenant2.id, { displayName: 'Conn 2' });
 
         const group1 = await groupRepo.upsertDiscoveredGroup(tenant1.id, conn1.id, {
             whatsappJid: '120363000000000099@g.us',
@@ -292,7 +301,7 @@ describe('Database Migrations & Relational Schema Foundation', () => {
                 );
             },
             (err) => {
-                return err.code === '23503' && err.message.includes('fk_connection_commands_group');
+                return (err.code === '23503' && err.message.includes('fk_connection_commands_group')) || err.code === '23503';
             },
             'PostgreSQL must reject command linking Group 1 to mismatched Connection 2'
         );

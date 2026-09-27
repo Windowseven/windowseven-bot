@@ -91,6 +91,7 @@ class HttpRouter {
 
         // 1. Exact route and method match
         if (matchedRoute) {
+            req.routePattern = matchedRoute.pattern;
             req.params = Object.assign(req.params || {}, matchedParams);
             return this.executeChain(matchedRoute.handlers, req, res);
         }

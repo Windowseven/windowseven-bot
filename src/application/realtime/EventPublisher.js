@@ -64,18 +64,39 @@ class LocalEventPublisher extends IEventPublisher {
         return envelope;
     }
 
+    /**
+     * Dispatches an incoming event locally to subscribers without broadcasting to PostgreSQL.
+     * Used by PostgresNotificationListener to route incoming cross-node events to local SSE clients.
+     *
+     * @param {object} envelope - Normalized event envelope { id, tenantId, eventType, data, timestamp }
+     */
+    dispatchLocal(envelope) {
+        if (!envelope || !envelope.tenantId || !envelope.eventType) return;
+        this.emitter.emit(`tenant:${envelope.tenantId}`, envelope);
+        this.emitter.emit('event', envelope);
+    }
+
     subscribe(tenantId, callback) {
+        if (typeof tenantId === 'function') {
+            const cb = tenantId;
+            this.emitter.on('event', cb);
+            return () => this.emitter.off('event', cb);
+        }
         if (!tenantId || typeof callback !== 'function') {
             throw new Error('tenantId and callback function are required to subscribe');
         }
 
-        const channel = `tenant:${tenantId}`;
+        const channel = tenantId === '*' ? 'event' : `tenant:${tenantId}`;
         this.emitter.on(channel, callback);
         return () => this.emitter.off(channel, callback);
     }
 
     unsubscribe(tenantId, callback) {
-        const channel = `tenant:${tenantId}`;
+        if (typeof tenantId === 'function') {
+            this.emitter.off('event', tenantId);
+            return;
+        }
+        const channel = tenantId === '*' ? 'event' : `tenant:${tenantId}`;
         this.emitter.off(channel, callback);
     }
 

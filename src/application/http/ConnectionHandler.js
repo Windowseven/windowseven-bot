@@ -1,5 +1,6 @@
 const ApiError = require('../errors/ApiError');
 const { validateUuid } = require('./validation');
+const { computeRequestHash } = require('../../repositories/IdempotencyRepository');
 
 /**
  * Registers WhatsApp connection lifecycle and realtime SSE routes.
@@ -13,6 +14,8 @@ const { validateUuid } = require('./validation');
  * @param {Function} params.requireTenantRole
  * @param {Function} params.sendJson
  * @param {Function} params.readJsonBody
+ * @param {import('../../repositories/IdempotencyRepository').IdempotencyRepository} [params.idempotencyRepo]
+ * @param {import('pg').Pool} [params.pool]
  */
 function registerConnectionRoutes({
     router,
@@ -23,6 +26,8 @@ function registerConnectionRoutes({
     requireTenantRole,
     sendJson,
     readJsonBody,
+    idempotencyRepo = null,
+    pool = null,
 }) {
     // -------------------------------------------------------------
     // Realtime Server-Sent Events (SSE) Route
@@ -64,12 +69,96 @@ function registerConnectionRoutes({
             const body = await readJsonBody(req);
             const ipAddress = req.ip || req.socket?.remoteAddress || null;
             const userAgent = req.headers['user-agent'] || null;
+            const tenantId = req.tenantContext.tenantId;
+            const userId = req.user.id;
+
+            const rawKey = req.headers['idempotency-key'] || req.headers['Idempotency-Key'];
+            const idempotencyKey = rawKey && typeof rawKey === 'string' ? rawKey.trim() : null;
+
+            if (idempotencyKey) {
+                if (!/^[a-zA-Z0-9_-]{1,128}$/.test(idempotencyKey)) {
+                    throw ApiError.badRequest('Invalid Idempotency-Key header format', 'INVALID_IDEMPOTENCY_KEY');
+                }
+            }
+
+            if (idempotencyKey && idempotencyRepo && pool) {
+                const normRoute = (req.url || '').split('?')[0].trim().toLowerCase();
+                const requestHash = computeRequestHash(req.method, normRoute, body);
+
+                const client = await pool.connect();
+                let shouldRollback = true;
+                try {
+                    await client.query('BEGIN');
+
+                    const { isNew, record } = await idempotencyRepo.reserveKey(client, {
+                        tenantId,
+                        userId,
+                        idempotencyKey,
+                        requestHash,
+                    });
+
+                    if (!isNew) {
+                        await client.query('ROLLBACK');
+                        shouldRollback = false;
+
+                        if (record.request_hash !== requestHash) {
+                            throw ApiError.conflict(
+                                'Idempotency key has already been used with a different request payload or route',
+                                'IDEMPOTENCY_CONFLICT'
+                            );
+                        }
+
+                        if (record.status === 'PENDING') {
+                            throw ApiError.conflict(
+                                'A request with this idempotency key is currently processing',
+                                'IDEMPOTENCY_CONFLICT'
+                            );
+                        }
+
+                        if (record.status === 'COMPLETED') {
+                            res.setHeader('X-Cache', 'IDEMPOTENT-REPLAY');
+                            return sendJson(res, record.response_status_code || 201, record.response_body);
+                        }
+
+                        throw ApiError.conflict('Idempotency key collision in invalid state', 'IDEMPOTENCY_CONFLICT');
+                    }
+
+                    // Authoritative creator: create connection inside the transaction
+                    const connection = await connectionService.createConnection({
+                        tenantId,
+                        phoneNumber: body.phoneNumber || null,
+                        displayName: body.displayName || null,
+                        actorUserId: userId,
+                        ipAddress,
+                        userAgent,
+                    }, client);
+
+                    const responseBody = { connection };
+                    await idempotencyRepo.completeKey(client, {
+                        id: record.id,
+                        statusCode: 201,
+                        responseBody,
+                    });
+
+                    await client.query('COMMIT');
+                    shouldRollback = false;
+
+                    return sendJson(res, 201, responseBody);
+                } catch (err) {
+                    if (shouldRollback) {
+                        await client.query('ROLLBACK').catch(() => {});
+                    }
+                    throw err;
+                } finally {
+                    client.release();
+                }
+            }
 
             const connection = await connectionService.createConnection({
-                tenantId: req.tenantContext.tenantId,
+                tenantId,
                 phoneNumber: body.phoneNumber || null,
                 displayName: body.displayName || null,
-                actorUserId: req.user.id,
+                actorUserId: userId,
                 ipAddress,
                 userAgent,
             });

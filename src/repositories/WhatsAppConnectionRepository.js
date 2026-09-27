@@ -47,7 +47,7 @@ class WhatsAppConnectionRepository {
         status = 'CREATED',
         desiredState = 'STOPPED',
         actualState = 'UNASSIGNED',
-    } = {}) {
+    } = {}, client = null) {
         if (!tenantId) {
             throw new Error('tenantId is required');
         }
@@ -61,6 +61,7 @@ class WhatsAppConnectionRepository {
             throw new Error(`Invalid status: ${status}. Valid statuses: ${validStatuses.join(', ')}`);
         }
 
+        const executor = client || this.pool;
         const sql = `
             INSERT INTO whatsapp_connections (
                 tenant_id, phone_number, display_name, status, desired_state, actual_state, last_status_at
@@ -68,7 +69,7 @@ class WhatsAppConnectionRepository {
             VALUES ($1, $2, $3, $4, $5, $6, NOW())
             RETURNING *;
         `;
-        const { rows } = await this.pool.query(sql, [
+        const { rows } = await executor.query(sql, [
             tenantId, phoneNumber, displayName, status, desiredState, actualState,
         ]);
         return this._mapRow(rows[0]);
@@ -93,6 +94,19 @@ class WhatsAppConnectionRepository {
             WHERE id = $1;
         `;
         const { rows } = await this.pool.query(sql, [id]);
+        return this._mapRow(rows[0]);
+    }
+
+    async findByTenantId(tenantId, client = null) {
+        if (!tenantId) return null;
+        const executor = client || this.pool;
+        const sql = `
+            SELECT *
+            FROM whatsapp_connections
+            WHERE tenant_id = $1
+            LIMIT 1;
+        `;
+        const { rows } = await executor.query(sql, [tenantId]);
         return this._mapRow(rows[0]);
     }
 
@@ -179,6 +193,9 @@ class WhatsAppConnectionRepository {
                 last_status_at = NOW()
             WHERE id = $3
               AND (tenant_id = $4 OR $4 IS NULL)
+              -- A stopping generation retains DB ownership until its own
+              -- runtime has executed teardown and released this lease.
+              AND actual_state <> 'SOCKET_STOPPING'
               AND (
                 assigned_worker_id IS NULL 
                 OR lease_expires_at < NOW() 
@@ -324,7 +341,7 @@ class WhatsAppConnectionRepository {
             FROM whatsapp_connections
             WHERE (
                 desired_state = 'RUNNING'
-                AND actual_state NOT IN ('ACTIVE', 'SOCKET_STARTING', 'AUTHENTICATING')
+                AND actual_state NOT IN ('ACTIVE', 'SOCKET_STARTING', 'AUTHENTICATING', 'SOCKET_STOPPING')
                 AND (assigned_worker_id IS NULL OR lease_expires_at < NOW() OR assigned_worker_id = $1)
             )
             OR (
@@ -338,6 +355,86 @@ class WhatsAppConnectionRepository {
 
         const { rows } = await this.pool.query(sql, [workerId, limit]);
         return rows.map((r) => this._mapRow(r));
+    }
+
+    /**
+     * Atomically transitions a connection into SOCKET_STOPPING under force disconnect.
+     * Prevents duplicate/conflicting concurrent transitions.
+     * @param {string} id
+     * @param {import('pg').PoolClient|null} [client]
+     */
+    async setSocketStopping(id, client = null) {
+        if (!id) throw new Error('Connection id is required');
+        const executor = client || this.pool;
+        const sql = `
+            UPDATE whatsapp_connections
+            SET desired_state = 'STOPPED',
+                actual_state = 'SOCKET_STOPPING',
+                updated_at = NOW()
+            WHERE id = $1 AND actual_state <> 'SOCKET_STOPPING'
+            RETURNING *;
+        `;
+        const { rows } = await executor.query(sql, [id]);
+        return this._mapRow(rows[0]);
+    }
+
+    /**
+     * Lists all connections across all tenants (for platform administrators).
+     * @param {object} [params]
+     * @param {number} [params.limit=50]
+     * @param {number} [params.offset=0]
+     * @param {string|null} [params.status]
+     * @param {string|null} [params.tenantId]
+     * @param {import('pg').PoolClient|null} [client]
+     */
+    async listAll({ limit = 50, offset = 0, status = null, tenantId = null } = {}, client = null) {
+        const executor = client || this.pool;
+        let sql = `SELECT * FROM whatsapp_connections`;
+        const params = [];
+        const conditions = [];
+
+        if (tenantId) {
+            params.push(tenantId);
+            conditions.push(`tenant_id = $${params.length}`);
+        }
+        if (status) {
+            params.push(status);
+            conditions.push(`status = $${params.length}`);
+        }
+
+        if (conditions.length > 0) {
+            sql += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        const { rows } = await executor.query(sql, params);
+        return rows.map((r) => this._mapRow(r));
+    }
+
+    /**
+     * Counts connections grouped by actual_state for low-cardinality metrics.
+     *
+     * @returns {Promise<Record<string, number>>}
+     */
+    async countByActualState() {
+        const { rows } = await this.pool.query(`
+            SELECT actual_state, COUNT(*)::int AS count
+            FROM whatsapp_connections
+            GROUP BY actual_state;
+        `);
+        const result = {
+            ACTIVE: 0,
+            SOCKET_STARTING: 0,
+            QR_PENDING: 0,
+            SOCKET_STOPPING: 0,
+            DISCONNECTED: 0,
+            UNASSIGNED: 0,
+        };
+        for (const row of rows) {
+            if (row.actual_state) {
+                result[row.actual_state] = row.count;
+            }
+        }
+        return result;
     }
 }
 

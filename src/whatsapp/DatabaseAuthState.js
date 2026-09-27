@@ -9,11 +9,11 @@ const { initAuthCreds, proto } = require('@whiskeysockets/baileys');
  * @param {object} repositories - { credsRepo, keysRepo }
  * @returns {Promise<{ state: { creds: any, keys: any }, saveCreds: () => Promise<any> }>}
  */
-async function useDatabaseAuthState(tenantId, connectionId, { credsRepo, keysRepo }) {
+async function useDatabaseAuthState(tenantId, connectionId, { credsRepo, keysRepo, fence }) {
     if (!tenantId || !connectionId) {
         throw new Error('tenantId and connectionId are strictly required to load auth state');
     }
-    if (!credsRepo || !keysRepo) {
+    if (!credsRepo || !keysRepo || !fence?.workerId || fence.leaseEpoch === undefined || fence.leaseEpoch === null) {
         throw new Error('credsRepo and keysRepo are required');
     }
 
@@ -23,7 +23,7 @@ async function useDatabaseAuthState(tenantId, connectionId, { credsRepo, keysRep
     if (!creds) {
         // First-time provisioning: no row exists in DB, generate fresh initial credentials
         creds = initAuthCreds();
-        await credsRepo.upsertCredentials(tenantId, connectionId, creds);
+        await credsRepo.upsertCredentials(tenantId, connectionId, creds, fence);
     }
 
     return {
@@ -42,12 +42,12 @@ async function useDatabaseAuthState(tenantId, connectionId, { credsRepo, keysRep
                     return data;
                 },
                 set: async (data) => {
-                    await keysRepo.setKeys(tenantId, connectionId, data);
+                    await keysRepo.setKeys(tenantId, connectionId, data, fence);
                 },
             },
         },
         saveCreds: async () => {
-            return credsRepo.upsertCredentials(tenantId, connectionId, creds);
+            return credsRepo.upsertCredentials(tenantId, connectionId, creds, fence);
         },
     };
 }

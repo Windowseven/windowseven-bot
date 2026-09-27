@@ -57,7 +57,7 @@ class TenantMembershipRepository {
         const executor = client || this.pool;
         const sql = `
             SELECT tm.id, tm.tenant_id, tm.user_id, tm.role, tm.created_at, tm.updated_at,
-                   t.name AS tenant_name
+                   t.name AS tenant_name, t.status AS tenant_status
             FROM tenant_memberships tm
             JOIN tenants t ON t.id = tm.tenant_id
             WHERE tm.user_id = $1

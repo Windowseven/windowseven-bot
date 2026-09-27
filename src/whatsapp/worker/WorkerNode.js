@@ -4,6 +4,7 @@ const WorkerLeaseManager = require('./WorkerLeaseManager');
 const { defaultQrStore } = require('../control/EphemeralQrStore');
 const { defaultEventPublisher } = require('../../application/realtime/EventPublisher');
 const { defaultCommandGateway } = require('../control/ConnectionCommandGateway');
+const { defaultMetricsRegistry } = require('../../application/metrics/MetricsRegistry');
 
 /**
  * Windowseven MD Distributed Worker Node
@@ -45,6 +46,9 @@ class WorkerNode {
         taskRepo = null,
         groupRepo = null,
         idempotencyRepo = null,
+        drainGraceMs = 10000,
+        leaseManager = null,
+        metricsRegistry = null,
     }) {
         if (!connectionManager || !connRepo) {
             throw new Error('connectionManager and connRepo are required for WorkerNode');
@@ -65,8 +69,11 @@ class WorkerNode {
         this.taskRepo = taskRepo;
         this.groupRepo = groupRepo;
         this.idempotencyRepo = idempotencyRepo;
+        this.drainGraceMs = drainGraceMs;
+        this.metricsRegistry = metricsRegistry || defaultMetricsRegistry;
+        this.inFlight = new Set();
 
-        this.leaseManager = new WorkerLeaseManager({
+        this.leaseManager = leaseManager || new WorkerLeaseManager({
             workerId: this.workerId,
             connRepo: this.connRepo,
             connectionManager: this.connectionManager,
@@ -85,8 +92,27 @@ class WorkerNode {
                 groupRepo: this.groupRepo,
                 auditLogRepo: this.auditLogRepo,
                 eventPublisher: this.eventPublisher,
+                metricsRegistry: this.metricsRegistry,
                 workerId: this.workerId,
                 pollIntervalMs: 5000,
+            });
+        }
+
+        // Initialize Remote Outcome Verification Service if dependencies are provided
+        this.verificationService = null;
+        if (this.commandRepo && this.taskRepo && this.pool && this.groupRepo) {
+            const RemoteOutcomeVerificationService = require('./RemoteOutcomeVerificationService');
+            this.verificationService = new RemoteOutcomeVerificationService({
+                pool: this.pool,
+                commandRepo: this.commandRepo,
+                taskRepo: this.taskRepo,
+                groupRepo: this.groupRepo,
+                connectionManager: this.connectionManager,
+                leaseManager: this.leaseManager,
+                auditLogRepo: this.auditLogRepo,
+                eventPublisher: this.eventPublisher,
+                metricsRegistry: this.metricsRegistry,
+                workerId: this.workerId,
             });
         }
 
@@ -107,18 +133,30 @@ class WorkerNode {
 
         // 1. Register in workers registry table if workerRepo is available
         if (this.workerRepo) {
-            await this.workerRepo.registerWorker({
-                id: this.workerId,
-                hostname: os.hostname(),
-                capacity: this.capacity,
-                status: 'READY',
-                metadata: {
-                    pid: process.pid,
-                    nodeVersion: process.version,
-                },
-            }).catch((err) => {
-                console.error(`[WorkerNode] Worker registration warning for ${this.workerId}:`, err.message);
-            });
+            try {
+                await this.workerRepo.registerWorker({
+                    id: this.workerId,
+                    hostname: os.hostname(),
+                    capacity: this.capacity,
+                    status: 'READY',
+                    metadata: {
+                        pid: process.pid,
+                        nodeVersion: process.version,
+                    },
+                });
+            } catch (err) {
+                this.status = 'FAILED';
+                console.error(`[WorkerNode] Worker registration failed for ${this.workerId}:`, err.message);
+                if (this.auditLogRepo) {
+                    this.auditLogRepo.create({
+                        action: 'WORKER_REGISTRATION_FAILED',
+                        resourceType: 'worker_node',
+                        resourceId: this.workerId,
+                        metadata: { error: err.message, hostname: os.hostname() },
+                    }).catch(() => {});
+                }
+                throw err;
+            }
         }
 
         this.status = 'READY';
@@ -148,8 +186,15 @@ class WorkerNode {
 
         // 4. Subscribe to control-plane wake-up commands
         if (this.commandGateway) {
+            if (typeof this.commandGateway.registerWorkerNode === 'function') {
+                this.commandGateway.registerWorkerNode(this);
+            }
             this._unsubscribeCommand = this.commandGateway.onCommand(async (cmd) => {
-                if (cmd?.command === 'RECONNECT_CONNECTION' && cmd?.connectionId && this.leaseManager.hasLease(cmd.connectionId)) {
+                if (cmd?.command === 'DRAIN_WORKER' && cmd?.workerId === this.workerId) {
+                    await this.drain({ graceMs: cmd.graceMs || this.drainGraceMs }).catch((err) => {
+                        console.error(`[WorkerNode] Error draining worker ${this.workerId}:`, err.message);
+                    });
+                } else if (cmd?.command === 'RECONNECT_CONNECTION' && cmd?.connectionId && this.leaseManager.hasLease(cmd.connectionId)) {
                     await this._handleReconnectCommand(cmd.connectionId).catch((err) => {
                         console.error(`[WorkerNode] Error handling reconnect command for ${cmd.connectionId}:`, err.message);
                     });
@@ -183,12 +228,24 @@ class WorkerNode {
      * Reads PostgreSQL to discover desired vs actual connection state and converges safely.
      */
     async reconcile() {
-        if (this.isStopped || this.isReconciling || this.status === 'DRAINING' || this.status === 'OFFLINE') {
+        if (this.isStopped || this.isReconciling || this.status === 'FAILED' || this.status === 'DRAINING' || this.status === 'OFFLINE') {
             return;
         }
 
         this.isReconciling = true;
         try {
+            // 1. Recover expired processing work (Class A & B boundaries)
+            if (this.commandRepo) {
+                await this.commandRepo.reapStaleCommands(null).catch((err) => {
+                    console.error(`[WorkerNode ${this.workerId}] Error reaping stale commands:`, err.message);
+                });
+            }
+            if (this.taskRepo) {
+                await this.taskRepo.reapStaleTasks(null).catch((err) => {
+                    console.error(`[WorkerNode ${this.workerId}] Error reaping stale tasks:`, err.message);
+                });
+            }
+
             const candidates = await this.connRepo.findReconciliationCandidates({
                 workerId: this.workerId,
                 limit: 25,
@@ -205,7 +262,17 @@ class WorkerNode {
                 }
             }
 
-            // Process durable commands for actively owned connections
+            // 2. Perform remote outcome verification for all actively leased connections
+            if (this.verificationService) {
+                const leasedConnIds = Array.from(this.leaseManager.leases.keys());
+                for (const connId of leasedConnIds) {
+                    await this.verificationService.verifyUnknownForConnection(connId).catch((err) => {
+                        console.error(`[WorkerNode ${this.workerId}] Error verifying unknown work for ${connId}:`, err.message);
+                    });
+                }
+            }
+
+            // 3. Process durable commands for actively owned connections
             await this._processPendingCommands();
         } finally {
             this.isReconciling = false;
@@ -278,6 +345,8 @@ class WorkerNode {
         // Start socket via ConnectionManager with lifecycle event hooks
         try {
             await this.connectionManager.createConnection(acquired.tenantId, acquired.id, {
+                workerId: this.workerId,
+                leaseEpoch: acquired.leaseEpoch,
                 onQR: async (qr) => {
                     // Store ephemeral QR in-memory with 60s TTL and current leaseEpoch (Never written to DB or logged)
                     this.qrStore.set(acquired.tenantId, acquired.id, qr, 60, acquired.leaseEpoch);
@@ -409,7 +478,7 @@ class WorkerNode {
      * Sweeps and claims eligible durable commands for actively leased connections.
      */
     async _processPendingCommands() {
-        if (!this.commandRepo || !this.pool) return;
+        if (this.status === 'DRAINING' || !this.commandRepo || !this.pool) return;
         const connectionIds = Array.from(this.leaseManager.leases.keys());
         if (connectionIds.length === 0) return;
 
@@ -442,6 +511,8 @@ class WorkerNode {
      */
     async _executeCommand(cmd, claimEpoch) {
         const { id, tenant_id: tenantId, connection_id: connectionId, group_id: groupId, command_type: commandType, payload } = cmd;
+        let remoteOperationStarted = false;
+        this.inFlight.add(id);
 
         // 1. Generation check: verify worker still holds lease
         if (!this.leaseManager.hasLease(connectionId)) {
@@ -491,12 +562,17 @@ class WorkerNode {
                 const ctx = {
                     tenantId,
                     connectionId,
+                    workerId: this.workerId,
+                    leaseEpoch: claimEpoch,
                     sock,
                 };
                 const syncRes = await synchronizer.syncAllParticipatingGroups(ctx, { expectedEpoch: claimEpoch });
-                if (!syncRes.success && syncRes.error === 'stale_generation') {
-                    await this.commandRepo.requeueStaleCommand(null, { id, workerId: this.workerId, claimEpoch });
-                    return;
+                if (!syncRes.success) {
+                    if (syncRes.error === 'stale_generation') {
+                        await this.commandRepo.requeueStaleCommand(null, { id, workerId: this.workerId, claimEpoch });
+                        return;
+                    }
+                    throw new Error(syncRes.error || 'SYNC_FAILED');
                 }
 
                 const completed = await this.commandRepo.completeCommand(null, {
@@ -507,6 +583,7 @@ class WorkerNode {
                 });
 
                 if (completed) {
+                    this.metricsRegistry?.durableCommandsTotal?.inc({ command: 'SYNC_GROUPS', status: 'COMPLETED' });
                     if (this.auditLogRepo) {
                         this.auditLogRepo.create({
                             tenantId,
@@ -526,25 +603,31 @@ class WorkerNode {
                 }
             } else if (commandType === 'MUTE_GROUP' || commandType === 'UNMUTE_GROUP' || commandType === 'KICK_PARTICIPANT') {
                 if (!groupId || !this.groupRepo) {
-                    await this.commandRepo.failCommand(null, {
+                    const failed = await this.commandRepo.failCommand(null, {
                         id,
                         workerId: this.workerId,
                         claimEpoch,
                         error: 'GROUP_REQUIRED',
                         isTerminal: true,
                     });
+                    if (failed) {
+                        this.metricsRegistry?.durableCommandsTotal?.inc({ command: commandType, status: 'FAILED' });
+                    }
                     return;
                 }
 
                 const group = await this.groupRepo.findByIdForTenant(groupId, tenantId);
                 if (!group || group.connection_id !== connectionId || group.status !== 'MANAGED') {
-                    await this.commandRepo.failCommand(null, {
+                    const failed = await this.commandRepo.failCommand(null, {
                         id,
                         workerId: this.workerId,
                         claimEpoch,
                         error: 'GROUP_NOT_MANAGED_OR_MISMATCHED',
                         isTerminal: true,
                     });
+                    if (failed) {
+                        this.metricsRegistry?.durableCommandsTotal?.inc({ command: commandType, status: 'FAILED' });
+                    }
                     return;
                 }
 
@@ -553,18 +636,26 @@ class WorkerNode {
                 const botJid = sock.user?.id;
                 const adminStatus = await gateway.checkAdminStatus(group.whatsapp_jid, botJid);
                 if (!adminStatus.isBotAdmin) {
-                    await this.commandRepo.failCommand(null, {
+                    const failed = await this.commandRepo.failCommand(null, {
                         id,
                         workerId: this.workerId,
                         claimEpoch,
                         error: 'BOT_NOT_ADMIN',
                         isTerminal: true,
                     });
+                    if (failed) {
+                        this.metricsRegistry?.durableCommandsTotal?.inc({ command: commandType, status: 'FAILED' });
+                    }
                     return;
                 }
 
                 if (commandType === 'MUTE_GROUP') {
-                    await gateway.muteGroup(group.whatsapp_jid);
+                    if (!await this.commandRepo.markRemoteStarted(null, { id, workerId: this.workerId, claimEpoch })) return;
+                    remoteOperationStarted = true;
+                    const muted = await gateway.muteGroup(group.whatsapp_jid);
+                    if (!muted) {
+                        throw new Error('REMOTE_MUTE_FAILED');
+                    }
 
                     // Critical Requirements A & B + Correction 1: Atomic completion + scheduled unmute activation
                     const txClient = await this.pool.connect();
@@ -576,6 +667,10 @@ class WorkerNode {
                             SET status = 'COMPLETED', executed_at = NOW(), updated_at = NOW()
                             WHERE id = $1 AND status = 'PROCESSING'
                               AND claimed_by_worker_id = $2 AND claim_epoch = $3
+                              AND EXISTS (SELECT 1 FROM whatsapp_connections c
+                                WHERE c.id = connection_commands.connection_id
+                                  AND c.assigned_worker_id = $2 AND c.lease_epoch = $3
+                                  AND c.lease_expires_at > NOW())
                             RETURNING id, executed_at;
                         `;
                         const compRes = await txClient.query(compSql, [id, this.workerId, claimEpoch]);
@@ -616,6 +711,7 @@ class WorkerNode {
                         }
 
                         await txClient.query('COMMIT');
+                        this.metricsRegistry?.durableCommandsTotal?.inc({ command: 'MUTE_GROUP', status: 'COMPLETED' });
 
                         if (this.auditLogRepo) {
                             this.auditLogRepo.create({
@@ -646,7 +742,12 @@ class WorkerNode {
                         txClient.release();
                     }
                 } else if (commandType === 'UNMUTE_GROUP') {
-                    await gateway.unmuteGroup(group.whatsapp_jid);
+                    if (!await this.commandRepo.markRemoteStarted(null, { id, workerId: this.workerId, claimEpoch })) return;
+                    remoteOperationStarted = true;
+                    const unmuted = await gateway.unmuteGroup(group.whatsapp_jid);
+                    if (!unmuted) {
+                        throw new Error('REMOTE_UNMUTE_FAILED');
+                    }
 
                     // Cancel any pending or processing scheduled unmutes for this group
                     if (this.taskRepo) {
@@ -666,6 +767,7 @@ class WorkerNode {
                     });
 
                     if (completed) {
+                        this.metricsRegistry?.durableCommandsTotal?.inc({ command: 'UNMUTE_GROUP', status: 'COMPLETED' });
                         if (this.auditLogRepo) {
                             this.auditLogRepo.create({
                                 tenantId,
@@ -690,29 +792,37 @@ class WorkerNode {
                 } else if (commandType === 'KICK_PARTICIPANT') {
                     const targetJid = payload?.participantJid;
                     if (!targetJid) {
-                        await this.commandRepo.failCommand(null, {
+                        const failed = await this.commandRepo.failCommand(null, {
                             id,
                             workerId: this.workerId,
                             claimEpoch,
                             error: 'TARGET_PARTICIPANT_REQUIRED',
                             isTerminal: true,
                         });
+                        if (failed) {
+                            this.metricsRegistry?.durableCommandsTotal?.inc({ command: 'KICK_PARTICIPANT', status: 'FAILED' });
+                        }
                         return;
                     }
 
                     // Check target is not admin and not bot
                     const targetAdminCheck = await gateway.checkAdminStatus(group.whatsapp_jid, targetJid);
                     if (targetAdminCheck.isSenderAdmin) {
-                        await this.commandRepo.failCommand(null, {
+                        const failed = await this.commandRepo.failCommand(null, {
                             id,
                             workerId: this.workerId,
                             claimEpoch,
                             error: 'TARGET_IS_ADMIN',
                             isTerminal: true,
                         });
+                        if (failed) {
+                            this.metricsRegistry?.durableCommandsTotal?.inc({ command: 'KICK_PARTICIPANT', status: 'FAILED' });
+                        }
                         return;
                     }
 
+                    if (!await this.commandRepo.markRemoteStarted(null, { id, workerId: this.workerId, claimEpoch })) return;
+                    remoteOperationStarted = true;
                     const kicked = await gateway.kickParticipant(group.whatsapp_jid, targetJid);
                     const completed = await this.commandRepo.completeCommand(null, {
                         id,
@@ -722,6 +832,7 @@ class WorkerNode {
                     });
 
                     if (completed) {
+                        this.metricsRegistry?.durableCommandsTotal?.inc({ command: 'KICK_PARTICIPANT', status: 'COMPLETED' });
                         if (this.auditLogRepo) {
                             this.auditLogRepo.create({
                                 tenantId,
@@ -747,7 +858,15 @@ class WorkerNode {
             }
         } catch (err) {
             console.error(`[WorkerNode ${this.workerId}] Error executing command ${id}:`, err.message);
-            await this.commandRepo.failCommand(null, {
+            if (remoteOperationStarted) {
+                // Do NOT increment terminal metrics on REMOTE_OUTCOME_UNKNOWN!
+                // REMOTE_OUTCOME_UNKNOWN is an in-flight intermediate state.
+                // The authoritative terminal metric will be recorded when resolved (COMPLETED/FAILED)
+                // by RemoteOutcomeVerificationService or PlatformService.forceFailCommand.
+                await this.commandRepo.markRemoteOutcomeUnknown(null, { id, workerId: this.workerId, claimEpoch, error: 'REMOTE_OUTCOME_UNKNOWN' });
+                return;
+            }
+            const failRes = await this.commandRepo.failCommand(null, {
                 id,
                 workerId: this.workerId,
                 claimEpoch,
@@ -755,31 +874,65 @@ class WorkerNode {
                 isTerminal: false,
                 backoffSeconds: 5,
             });
+            if (failRes === 'FAILED') {
+                this.metricsRegistry?.durableCommandsTotal?.inc({ command: commandType, status: 'FAILED' });
+            }
+        } finally {
+            this.inFlight.delete(id);
         }
     }
 
-    /**
-     * Controlled drain: stops receiving assignments and safely releases/stops connections.
-     */
-    async drain() {
-        this.status = 'DRAINING';
-        if (this.workerRepo) {
-            await this.workerRepo.updateStatus(this.workerId, 'DRAINING').catch(() => {});
-        }
+    drain({ graceMs = this.drainGraceMs } = {}) {
+        if (this._drainPromise) return this._drainPromise;
+        this._drainPromise = (async () => {
+            this.status = 'DRAINING';
+            if (this.workerRepo) {
+                await this.workerRepo.updateStatus(this.workerId, 'DRAINING').catch(() => {});
+            }
 
-        const leasedIds = Array.from(this.leaseManager.leases.keys());
-        for (const connId of leasedIds) {
-            const lease = this.leaseManager.getLease(connId);
-            if (lease) {
+            // Snapshot active leases before stopping lease manager
+            const activeLeases = Array.from(this.leaseManager.leases.values()).map((l) => ({ ...l }));
+
+            // Immediately stop lease heartbeats so leases can expire or transfer (Test 4)
+            this.leaseManager.stop();
+
+            // Clear periodic reconcile timer immediately
+            if (this.reconcileTimer) {
+                clearInterval(this.reconcileTimer);
+                this.reconcileTimer = null;
+            }
+
+            // No new durable work may be claimed after DRAINING is visible locally (Test 3)
+            if (this.scheduler) this.scheduler.stop();
+
+            // Existing work is allowed a bounded chance to finish. A timeout does
+            // not infer remote failure: only durable remote-started work is marked unknown.
+            const deadline = Date.now() + Math.max(0, graceMs);
+            while (this.inFlight.size > 0 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, Math.min(25, deadline - Date.now())));
+            }
+            if (this.inFlight.size > 0 && this.commandRepo) {
+                await this.commandRepo.markRemoteStartedUnknownForWorker(null, { workerId: this.workerId }).catch(() => {});
+            }
+            if (this.inFlight.size > 0 && this.taskRepo) {
+                await this.taskRepo.markRemoteStartedUnknownForWorker(null, { workerId: this.workerId }).catch(() => {});
+            }
+
+            for (const lease of activeLeases) {
+                const connId = lease.connectionId;
+                await this.connRepo.updateActualState({ connectionId: connId, workerId: this.workerId, leaseEpoch: lease.leaseEpoch, actualState: 'SOCKET_STOPPING', status: 'DISCONNECTED' }).catch(() => {});
+                // This is runtime teardown initiation, not proof of physical liveness.
                 await this.connectionManager.disconnectConnection(connId, 'worker_draining').catch(() => {});
                 await this.connRepo.releaseLease({
                     connectionId: connId,
                     workerId: this.workerId,
                     leaseEpoch: lease.leaseEpoch,
                 }).catch(() => {});
-                this.leaseManager.unregisterLease(connId);
             }
-        }
+            this.status = 'OFFLINE';
+            if (this.workerRepo) await this.workerRepo.updateStatus(this.workerId, 'OFFLINE').catch(() => {});
+        })();
+        return this._drainPromise;
     }
 
     /**
@@ -808,9 +961,214 @@ class WorkerNode {
 
         this.leaseManager.stop();
 
+        if (this.commandGateway && typeof this.commandGateway.unregisterWorkerNode === 'function') {
+            this.commandGateway.unregisterWorkerNode(this.workerId);
+        }
+
         if (this.workerRepo) {
             await this.workerRepo.updateStatus(this.workerId, 'OFFLINE').catch(() => {});
         }
+    }
+
+    async stop() {
+        return this.shutdown();
+    }
+
+    /**
+     * Executes a read-only remote probe for a command on this worker's active leased socket.
+     * Guaranteed read-only: no database mutations, no downstream obligations.
+     *
+     * @param {string} commandId
+     * @returns {Promise<object>} Sanitized remote state summary
+     */
+    async probeCommand(commandId) {
+        if (!this.commandRepo) throw new Error('commandRepo is required for probe');
+        const cmd = await this.commandRepo.findById(commandId);
+        if (!cmd) return null;
+
+        if (!this.leaseManager.hasLease(cmd.connection_id)) {
+            const err = new Error('Connection is not leased by this worker');
+            err.code = 'CONNECTION_NOT_LEASED_BY_WORKER';
+            throw err;
+        }
+
+        const sock = this.connectionManager.getSocket(cmd.connection_id);
+        if (!sock) {
+            const err = new Error('WhatsApp socket is not connected for this connection');
+            err.code = 'SOCKET_UNAVAILABLE';
+            throw err;
+        }
+
+        const group = await this.groupRepo.findByIdForTenant(cmd.group_id, cmd.tenant_id);
+        if (!group || !group.whatsapp_jid) {
+            const err = new Error('Group not found or missing whatsapp_jid');
+            err.code = 'GROUP_NOT_FOUND';
+            throw err;
+        }
+
+        const metadata = await sock.groupMetadata(group.whatsapp_jid);
+        const targetJid = cmd.payload?.participantJid;
+
+        return {
+            commandId: cmd.id,
+            connectionId: cmd.connection_id,
+            groupId: group.id,
+            groupJid: group.whatsapp_jid,
+            subject: metadata?.subject || null,
+            announce: Boolean(metadata?.announce),
+            restrict: Boolean(metadata?.restrict),
+            participantCount: Array.isArray(metadata?.participants) ? metadata.participants.length : 0,
+            targetParticipantPresent: targetJid && Array.isArray(metadata?.participants)
+                ? metadata.participants.some((p) => p.id === targetJid)
+                : null,
+        };
+    }
+
+    /**
+     * Executes a read-only remote probe for a scheduled task on this worker's active leased socket.
+     * Guaranteed read-only: no database mutations.
+     *
+     * @param {string} taskId
+     * @returns {Promise<object>} Sanitized remote state summary
+     */
+    async probeTask(taskId) {
+        if (!this.taskRepo) throw new Error('taskRepo is required for probe');
+        const task = await this.taskRepo.findById(taskId);
+        if (!task) return null;
+
+        if (!this.leaseManager.hasLease(task.connection_id)) {
+            const err = new Error('Connection is not leased by this worker');
+            err.code = 'CONNECTION_NOT_LEASED_BY_WORKER';
+            throw err;
+        }
+
+        const sock = this.connectionManager.getSocket(task.connection_id);
+        if (!sock) {
+            const err = new Error('WhatsApp socket is not connected for this connection');
+            err.code = 'SOCKET_UNAVAILABLE';
+            throw err;
+        }
+
+        const group = await this.groupRepo.findByIdForTenant(task.group_id, task.tenant_id);
+        if (!group || !group.whatsapp_jid) {
+            const err = new Error('Group not found or missing whatsapp_jid');
+            err.code = 'GROUP_NOT_FOUND';
+            throw err;
+        }
+
+        const metadata = await sock.groupMetadata(group.whatsapp_jid);
+
+        return {
+            taskId: task.id,
+            connectionId: task.connection_id,
+            groupId: group.id,
+            groupJid: group.whatsapp_jid,
+            subject: metadata?.subject || null,
+            announce: Boolean(metadata?.announce),
+            restrict: Boolean(metadata?.restrict),
+            participantCount: Array.isArray(metadata?.participants) ? metadata.participants.length : 0,
+        };
+    }
+
+    /**
+     * Executes fenced outcome resolution for a command in REMOTE_OUTCOME_UNKNOWN.
+     * Uses the exact same verification logic and fencing as background verification.
+     *
+     * @param {string} commandId
+     * @returns {Promise<object>} Authoritative command state
+     */
+    async resolveCommand(commandId) {
+        if (!this.commandRepo) throw new Error('commandRepo is required for resolution');
+        const cmd = await this.commandRepo.findById(commandId);
+        if (!cmd) return null;
+
+        // If already resolved by background sweeper or another operator, return current authoritative state
+        if (cmd.status === 'COMPLETED' || cmd.status === 'FAILED') {
+            return cmd;
+        }
+
+        const lease = this.leaseManager.getLease(cmd.connection_id);
+        if (!lease) {
+            const err = new Error('Connection is not leased by this worker');
+            err.code = 'CONNECTION_NOT_LEASED_BY_WORKER';
+            throw err;
+        }
+
+        const sock = this.connectionManager.getSocket(cmd.connection_id);
+        if (!sock) {
+            const err = new Error('WhatsApp socket is not connected for this connection');
+            err.code = 'SOCKET_UNAVAILABLE';
+            throw err;
+        }
+
+        if (this.verificationService) {
+            await this.verificationService.verifyCommand(cmd, { sock, claimEpoch: lease.leaseEpoch });
+        }
+
+        return this.commandRepo.findById(commandId);
+    }
+
+    /**
+     * Executes fenced outcome resolution for a scheduled task in REMOTE_OUTCOME_UNKNOWN.
+     * Uses the exact same verification logic and fencing as background verification.
+     *
+     * @param {string} taskId
+     * @returns {Promise<object>} Authoritative task state
+     */
+    async resolveTask(taskId) {
+        if (!this.taskRepo) throw new Error('taskRepo is required for resolution');
+        const task = await this.taskRepo.findById(taskId);
+        if (!task) return null;
+
+        if (task.status === 'COMPLETED' || task.status === 'FAILED') {
+            return task;
+        }
+
+        const lease = this.leaseManager.getLease(task.connection_id);
+        if (!lease) {
+            const err = new Error('Connection is not leased by this worker');
+            err.code = 'CONNECTION_NOT_LEASED_BY_WORKER';
+            throw err;
+        }
+
+        const sock = this.connectionManager.getSocket(task.connection_id);
+        if (!sock) {
+            const err = new Error('WhatsApp socket is not connected for this connection');
+            err.code = 'SOCKET_UNAVAILABLE';
+            throw err;
+        }
+
+        if (this.verificationService) {
+            await this.verificationService.verifyTask(task, { sock, claimEpoch: lease.leaseEpoch });
+        }
+
+        return this.taskRepo.findById(taskId);
+    }
+
+    /**
+     * Requests an ephemeral pairing code from the leased connection's active socket.
+     * Enforces worker lease ownership and generation fencing.
+     *
+     * @param {string} connectionId
+     * @param {string} phoneNumber
+     * @returns {Promise<string>} Formatted pairing code
+     */
+    async requestPairingCode(connectionId, phoneNumber) {
+        if (!connectionId) throw new Error('connectionId is required');
+        if (!phoneNumber) throw new Error('phoneNumber is required');
+
+        const lease = this.leaseManager.getLease(connectionId);
+        if (!lease) {
+            const err = new Error('Connection is not leased by this worker');
+            err.code = 'CONNECTION_NOT_LEASED_BY_WORKER';
+            throw err;
+        }
+
+        const code = await this.connectionManager.requestPairingCode(connectionId, phoneNumber, {
+            leaseEpoch: lease.leaseEpoch,
+        });
+
+        return code;
     }
 }
 

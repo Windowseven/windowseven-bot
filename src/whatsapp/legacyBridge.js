@@ -1,7 +1,14 @@
 const PhoneNumber = require('awesome-phonenumber');
 const { jidDecode } = require('@whiskeysockets/baileys');
 const { smsg } = require('../../lib/myfunc');
-const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('../../main');
+
+let _legacyMain = null;
+function getLegacyMain() {
+    if (!_legacyMain) {
+        _legacyMain = require('../../main');
+    }
+    return _legacyMain;
+}
 
 // Lightweight store
 const store = require('../../lib/lightweight_store');
@@ -108,6 +115,11 @@ function attachLegacyBridge(adapter, { tenantId, connectionId, pipeline = null }
                     return;
                 }
 
+                if (pipelineRes && (pipelineRes.reason === 'tenant_suspended' || pipelineRes.reason === 'tenant_deactivated')) {
+                    // Suspended or deactivated tenant: suppress legacy execution
+                    return;
+                }
+
                 // If group is not managed, enforce SaaS security boundaries:
                 // 1. Migrated commands must NEVER execute on unmanaged groups
                 // 2. Automatic policies must NEVER run on unmanaged groups
@@ -127,7 +139,7 @@ function attachLegacyBridge(adapter, { tenantId, connectionId, pipeline = null }
             }
 
             if (message.remoteJid === 'status@broadcast') {
-                await handleStatus(socket, { messages: [raw], type: 'notify' });
+                await getLegacyMain().handleStatus(socket, { messages: [raw], type: 'notify' });
                 return;
             }
 
@@ -149,7 +161,7 @@ function attachLegacyBridge(adapter, { tenantId, connectionId, pipeline = null }
             };
 
             try {
-                await handleMessages(socket, chatUpdate, true);
+                await getLegacyMain().handleMessages(socket, chatUpdate, true);
             } catch (err) {
                 console.error(`[LegacyBridge ${tenantId}:${connectionId}] Error in handleMessages:`, err.message);
                 if (message.remoteJid) {
@@ -166,7 +178,7 @@ function attachLegacyBridge(adapter, { tenantId, connectionId, pipeline = null }
     // 2. Normalized Group Participants Changed Ingestion
     adapter.on('group.participants.changed', async (event) => {
         try {
-            await handleGroupParticipantUpdate(socket, event.raw);
+            await getLegacyMain().handleGroupParticipantUpdate(socket, event.raw);
         } catch (err) {
             console.error(`[LegacyBridge ${tenantId}:${connectionId}] Error in group participants update:`, err.message);
         }
@@ -175,7 +187,7 @@ function attachLegacyBridge(adapter, { tenantId, connectionId, pipeline = null }
     // 3. Normalized Reaction Ingestion
     adapter.on('message.reaction', async (event) => {
         try {
-            await handleStatus(socket, event.raw);
+            await getLegacyMain().handleStatus(socket, event.raw);
         } catch (_) {}
     });
 

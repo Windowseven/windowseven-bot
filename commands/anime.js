@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const webp = require('node-webpmux');
@@ -30,12 +30,12 @@ async function sendAnimu(sock, chatId, message, type) {
         const output = path.join(tmpDir, `animu_${Date.now()}.webp`);
         fs.writeFileSync(input, mediaBuffer);
 
-        const ffmpegCmd = isAnimated 
-            ? `ffmpeg -y -i "${input}" -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000,fps=15" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 60 -compression_level 6 "${output}"`
-            : `ffmpeg -y -i "${input}" -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 75 -compression_level 6 "${output}"`;
+        const ffmpegArgs = isAnimated 
+            ? ['-y', '-i', input, '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000,fps=15', '-c:v', 'libwebp', '-preset', 'default', '-loop', '0', '-vsync', '0', '-pix_fmt', 'yuva420p', '-quality', '60', '-compression_level', '6', output]
+            : ['-y', '-i', input, '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000', '-c:v', 'libwebp', '-preset', 'default', '-loop', '0', '-vsync', '0', '-pix_fmt', 'yuva420p', '-quality', '75', '-compression_level', '6', output];
 
         await new Promise((resolve, reject) => {
-            exec(ffmpegCmd, (err) => (err ? reject(err) : resolve()));
+            execFile('ffmpeg', ffmpegArgs, (err) => (err ? reject(err) : resolve()));
         });
 
         let webpBuffer = fs.readFileSync(output);

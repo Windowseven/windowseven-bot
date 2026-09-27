@@ -206,7 +206,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
         });
         // Transition connA to ACTIVE for moderation tests
         await pool.query(
-            `UPDATE whatsapp_connections SET actual_state = 'ACTIVE', desired_state = 'RUNNING' WHERE id = $1;`,
+            `UPDATE whatsapp_connections SET actual_state = 'ACTIVE', desired_state = 'RUNNING', assigned_worker_id = 'worker-fixture-a', lease_epoch = 1, lease_expires_at = NOW() + INTERVAL '1 hour' WHERE id = $1;`,
             [connA.id]
         );
 
@@ -808,7 +808,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 await client.query('BEGIN');
                 const claimed = await commandRepo.claimCommandForConnection(client, {
                     connectionId: connA.id,
-                    workerId: 'worker-test-bot-admin',
+                    workerId: 'worker-fixture-a',
                     claimEpoch: 1,
                 });
                 await client.query('COMMIT');
@@ -816,7 +816,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 // Simulate worker executing command where gateway reports isBotAdmin: false
                 await commandRepo.failCommand(null, {
                     id: claimed.id,
-                    workerId: 'worker-test-bot-admin',
+                    workerId: 'worker-fixture-a',
                     claimEpoch: claimed.claim_epoch,
                     error: 'BOT_NOT_ADMIN',
                     isTerminal: true,
@@ -959,6 +959,96 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
             assert.strictEqual(res.statusCode, 400);
             assert.strictEqual(res.body.error.code, 'INVALID_IDEMPOTENCY_KEY');
         });
+
+        it('POST /moderation/unmute: initial request with Idempotency-Key returns 202 and replay returns identical response', async () => {
+            const unmuteKey = `idem-unmute-${Date.now()}`;
+            const res1 = await request('POST', `/api/v1/tenants/${tenantA.id}/groups/${groupA1.id}/moderation/unmute`, {
+                headers: {
+                    Authorization: `Bearer ${tokenAdminA}`,
+                    'Idempotency-Key': unmuteKey,
+                },
+                body: { reason: 'Scheduled quiet time ended' },
+            });
+
+            assert.strictEqual(res1.statusCode, 202);
+            assert.strictEqual(res1.body.data.action, 'UNMUTE_GROUP');
+            assert.ok(res1.body.data.commandId);
+            const cmdId = res1.body.data.commandId;
+
+            // Replay with identical key and payload
+            const res2 = await request('POST', `/api/v1/tenants/${tenantA.id}/groups/${groupA1.id}/moderation/unmute`, {
+                headers: {
+                    Authorization: `Bearer ${tokenAdminA}`,
+                    'Idempotency-Key': unmuteKey,
+                },
+                body: { reason: 'Scheduled quiet time ended' },
+            });
+
+            assert.strictEqual(res2.statusCode, 202);
+            assert.strictEqual(res2.body.data.commandId, cmdId, 'Replay must return original commandId');
+
+            // Count commands in database for this group and key
+            const cmdCountRes = await pool.query(
+                'SELECT count(*) FROM connection_commands WHERE tenant_id = $1 AND group_id = $2 AND command_type = \'UNMUTE_GROUP\' AND id = $3;',
+                [tenantA.id, groupA1.id, cmdId]
+            );
+            assert.strictEqual(Number(cmdCountRes.rows[0].count), 1, 'Only one command must be created');
+        });
+
+        it('POST /moderation/unmute: duplicate Idempotency-Key with different payload rejects with 422 IDEMPOTENCY_KEY_MISMATCH', async () => {
+            const unmuteKey = `idem-unmute-diff-${Date.now()}`;
+            const res1 = await request('POST', `/api/v1/tenants/${tenantA.id}/groups/${groupA1.id}/moderation/unmute`, {
+                headers: {
+                    Authorization: `Bearer ${tokenAdminA}`,
+                    'Idempotency-Key': unmuteKey,
+                },
+                body: { reason: 'Original reason' },
+            });
+            assert.strictEqual(res1.statusCode, 202);
+
+            const res2 = await request('POST', `/api/v1/tenants/${tenantA.id}/groups/${groupA1.id}/moderation/unmute`, {
+                headers: {
+                    Authorization: `Bearer ${tokenAdminA}`,
+                    'Idempotency-Key': unmuteKey,
+                },
+                body: { reason: 'Completely different reason' },
+            });
+            assert.strictEqual(res2.statusCode, 422);
+            assert.strictEqual(res2.body.error.code, 'IDEMPOTENCY_KEY_MISMATCH');
+        });
+
+        it('POST /moderation/unmute: concurrent requests with same Idempotency-Key yield exactly one command', async () => {
+            const concurrentKey = `idem-unmute-concurrent-${Date.now()}`;
+            const promises = [
+                request('POST', `/api/v1/tenants/${tenantA.id}/groups/${groupA1.id}/moderation/unmute`, {
+                    headers: {
+                        Authorization: `Bearer ${tokenAdminA}`,
+                        'Idempotency-Key': concurrentKey,
+                    },
+                    body: { reason: 'Concurrent unmute' },
+                }),
+                request('POST', `/api/v1/tenants/${tenantA.id}/groups/${groupA1.id}/moderation/unmute`, {
+                    headers: {
+                        Authorization: `Bearer ${tokenAdminA}`,
+                        'Idempotency-Key': concurrentKey,
+                    },
+                    body: { reason: 'Concurrent unmute' },
+                }),
+            ];
+
+            const [resA, resB] = await Promise.all(promises);
+            // One succeeds with 202; the other either receives 202 replay (if serialized) or 409 IDEMPOTENCY_CONFLICT (if overlapping PENDING)
+            assert.ok(resA.statusCode === 202 || resB.statusCode === 202);
+            if (resA.statusCode === 202 && resB.statusCode === 202) {
+                assert.strictEqual(resA.body.data.commandId, resB.body.data.commandId);
+            } else if (resA.statusCode === 202) {
+                assert.strictEqual(resB.statusCode, 409);
+                assert.strictEqual(resB.body.error.code, 'IDEMPOTENCY_CONFLICT');
+            } else {
+                assert.strictEqual(resA.statusCode, 409);
+                assert.strictEqual(resA.body.error.code, 'IDEMPOTENCY_CONFLICT');
+            }
+        });
     });
 
     // =========================================================================
@@ -984,7 +1074,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 await client.query('BEGIN');
                 const claimed = await commandRepo.claimCommandForConnection(client, {
                     connectionId: connA.id,
-                    workerId: 'worker-node-alpha',
+                    workerId: 'worker-fixture-a',
                     claimEpoch: 1,
                 });
                 await client.query('COMMIT');
@@ -992,7 +1082,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 assert.ok(claimed);
                 assert.strictEqual(claimed.id, testCmd.id);
                 assert.strictEqual(claimed.status, 'PROCESSING');
-                assert.strictEqual(claimed.claimed_by_worker_id, 'worker-node-alpha');
+                assert.strictEqual(claimed.claimed_by_worker_id, 'worker-fixture-a');
                 assert.strictEqual(Number(claimed.claim_epoch), 1);
             } finally {
                 client.release();
@@ -1006,7 +1096,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 await client.query('BEGIN');
                 const claimed1 = await commandRepo.claimCommandForConnection(client, {
                     connectionId: connA.id,
-                    workerId: 'worker-1',
+                    workerId: 'worker-fixture-a',
                     claimEpoch: 1,
                 });
                 await client.query('COMMIT');
@@ -1077,7 +1167,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 // Claim command
                 const claimed = await commandRepo.claimCommandForConnection(client, {
                     connectionId: connA.id,
-                    workerId: 'worker-active-1',
+                    workerId: 'worker-fixture-a',
                     claimEpoch: 1,
                 });
                 assert.strictEqual(claimed.id, muteCmd.id);
@@ -1107,7 +1197,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 // 3. Mark MUTE command COMPLETED
                 const completed = await commandRepo.completeCommand(client, {
                     id: claimed.id,
-                    workerId: 'worker-active-1',
+                    workerId: 'worker-fixture-a',
                     claimEpoch: 1,
                     result: { status: 'MUTED', executedAt: executedAt.toISOString() },
                 });
@@ -1131,14 +1221,14 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 await client.query('BEGIN');
                 const claimed = await commandRepo.claimCommandForConnection(client, {
                     connectionId: connA.id,
-                    workerId: 'worker-fail-test',
+                    workerId: 'worker-fixture-a',
                     claimEpoch: 1,
                 });
 
                 // Simulate failure on WhatsApp
                 await commandRepo.failCommand(client, {
                     id: claimed.id,
-                    workerId: 'worker-fail-test',
+                    workerId: 'worker-fixture-a',
                     claimEpoch: claimed.claim_epoch,
                     error: 'WhatsApp network timeout',
                     isTerminal: true,
@@ -1224,7 +1314,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 await client.query('BEGIN');
                 const claimed = await taskRepo.claimNextTask(client, {
                     connectionIds: [connA.id],
-                    workerId: 'worker-scheduler-1',
+                    workerId: 'worker-fixture-a',
                     getLeaseEpochForConnection: () => 1,
                 });
                 await client.query('COMMIT');
@@ -1232,7 +1322,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 assert.ok(claimed);
                 assert.strictEqual(claimed.id, dueTask.id);
                 assert.strictEqual(claimed.status, 'PROCESSING');
-                assert.strictEqual(claimed.claimed_by_worker_id, 'worker-scheduler-1');
+                assert.strictEqual(claimed.claimed_by_worker_id, 'worker-fixture-a');
             } finally {
                 client.release();
             }
@@ -1274,7 +1364,7 @@ describe('Phase 4E: Policy & Moderation REST Endpoints + Durable Moderation Sche
                 groupRepo,
                 leaseManager: mockLeaseManager,
                 connectionManager: mockConnectionManager,
-                workerId: 'worker-test-sched',
+                workerId: 'worker-fixture-a',
                 pollIntervalMs: 100000,
             });
 

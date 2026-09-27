@@ -22,6 +22,7 @@ describe('Database-Backed Baileys Authentication State', () => {
 
     let tenantA, tenantB;
     let connA, connB;
+    let fenceA, fenceB;
 
     before(async () => {
         pool = new Pool({ connectionString: TEST_DB_URL });
@@ -46,6 +47,10 @@ describe('Database-Backed Baileys Authentication State', () => {
             phoneNumber: '255700000020',
             displayName: 'Auth Bot B',
         });
+        const leaseA = await connRepo.acquireLease({ connectionId: connA.id, tenantId: tenantA.id, workerId: 'auth-test-a' });
+        const leaseB = await connRepo.acquireLease({ connectionId: connB.id, tenantId: tenantB.id, workerId: 'auth-test-b' });
+        fenceA = { workerId: 'auth-test-a', leaseEpoch: leaseA.leaseEpoch };
+        fenceB = { workerId: 'auth-test-b', leaseEpoch: leaseB.leaseEpoch };
     });
 
     after(async () => {
@@ -53,7 +58,7 @@ describe('Database-Backed Baileys Authentication State', () => {
     });
 
     it('should initialize fresh credentials when no auth row exists', async () => {
-        const authState = await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo });
+        const authState = await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo, fence: fenceA });
         assert.ok(authState.state.creds);
         assert.ok(authState.state.creds.noiseKey);
         assert.ok(Buffer.isBuffer(authState.state.creds.noiseKey.private));
@@ -66,7 +71,7 @@ describe('Database-Backed Baileys Authentication State', () => {
     });
 
     it('should preserve binary Buffers across save and reload (BufferJSON fidelity)', async () => {
-        const authState = await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo });
+        const authState = await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo, fence: fenceA });
 
         // Mutate creds with custom buffer data
         const testBuffer = Buffer.from('windowseven_test_secret_payload_12345', 'utf8');
@@ -83,7 +88,7 @@ describe('Database-Backed Baileys Authentication State', () => {
     });
 
     it('should batch get and set Signal keys and handle key deletion', async () => {
-        const authState = await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo });
+        const authState = await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo, fence: fenceA });
 
         const preKey1 = {
             keyPair: {
@@ -132,7 +137,7 @@ describe('Database-Backed Baileys Authentication State', () => {
     });
 
     it('should isolate auth state between different connections and tenants', async () => {
-        const authStateB = await useDatabaseAuthState(tenantB.id, connB.id, { credsRepo, keysRepo });
+        const authStateB = await useDatabaseAuthState(tenantB.id, connB.id, { credsRepo, keysRepo, fence: fenceB });
 
         // Set key on Connection B
         await authStateB.state.keys.set({
@@ -152,10 +157,10 @@ describe('Database-Backed Baileys Authentication State', () => {
         // Composite foreign key: Attempting to insert credentials for Connection B under Tenant A
         await assert.rejects(
             async () => {
-                await credsRepo.upsertCredentials(tenantA.id, connB.id, initAuthCreds());
+                await credsRepo.upsertCredentials(tenantA.id, connB.id, initAuthCreds(), fenceA);
             },
-            (err) => err.code === '23503' || err.message.includes('foreign key'),
-            'PostgreSQL composite foreign key must reject mismatched tenant for credentials'
+            (err) => err.code === '23503' || err.message.includes('foreign key') || err.message.includes('stale or missing worker lease'),
+            'Tenant mismatch must be rejected before credentials can be persisted'
         );
     });
 
@@ -164,7 +169,7 @@ describe('Database-Backed Baileys Authentication State', () => {
         let authInstance = null;
 
         // Recreate brand new auth state instance from DB
-        authInstance = await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo });
+        authInstance = await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo, fence: fenceA });
         assert.ok(authInstance.state.creds);
         assert.strictEqual(authInstance.state.creds.registered, true);
         assert.strictEqual(authInstance.state.creds.testBuffer.toString('utf8'), 'windowseven_test_secret_payload_12345');
@@ -187,7 +192,7 @@ describe('Database-Backed Baileys Authentication State', () => {
         // Attempting to load auth state must throw corruption error and MUST NOT call initAuthCreds
         await assert.rejects(
             async () => {
-                await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo });
+                await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo, keysRepo, fence: fenceA });
             },
             (err) => {
                 return err.isCorrupted === true || err.message.includes('cannot deserialize');
@@ -198,7 +203,7 @@ describe('Database-Backed Baileys Authentication State', () => {
         // Restore valid credentials for subsequent tests
         const validCreds = initAuthCreds();
         validCreds.registered = true;
-        await credsRepo.upsertCredentials(tenantA.id, connA.id, validCreds);
+        await credsRepo.upsertCredentials(tenantA.id, connA.id, validCreds, fenceA);
     });
 
     it('should fail closed when database query fails (no silent fresh init on DB error)', async () => {
@@ -212,10 +217,23 @@ describe('Database-Backed Baileys Authentication State', () => {
 
         await assert.rejects(
             async () => {
-                await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo: brokenCredsRepo, keysRepo });
+                await useDatabaseAuthState(tenantA.id, connA.id, { credsRepo: brokenCredsRepo, keysRepo, fence: fenceA });
             },
             /Connection refused/,
             'Database error must throw and fail closed, never silently generating new credentials'
         );
+    });
+
+    it('P0: rejects delayed credential and Signal-key writes from an old generation', async () => {
+        await pool.query("UPDATE whatsapp_connections SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1", [connA.id]);
+        const next = await connRepo.acquireLease({ connectionId: connA.id, tenantId: tenantA.id, workerId: 'auth-test-new' });
+        const currentFence = { workerId: 'auth-test-new', leaseEpoch: next.leaseEpoch };
+        await credsRepo.upsertCredentials(tenantA.id, connA.id, initAuthCreds(), currentFence);
+        await assert.rejects(() => credsRepo.upsertCredentials(tenantA.id, connA.id, initAuthCreds(), fenceA), /stale or missing worker lease/);
+        await keysRepo.setKeys(tenantA.id, connA.id, { session: { current: { value: Buffer.from('current') } } }, currentFence);
+        await assert.rejects(() => keysRepo.setKeys(tenantA.id, connA.id, { session: { stale: { value: Buffer.from('stale') } } }, fenceA), /stale or missing worker lease/);
+        const keys = await keysRepo.getKeys(tenantA.id, connA.id, 'session', ['current', 'stale']);
+        assert.ok(keys.current);
+        assert.strictEqual(keys.stale, undefined);
     });
 });

@@ -27,12 +27,11 @@ setInterval(() => {
     }
 }, 60_000).unref();
 
-// Memory monitoring - Restart if RAM gets too high
+// Memory monitoring - Log warning if RAM gets high (abrupt exit neutralized in Phase 4G)
 setInterval(() => {
     const used = process.memoryUsage().rss / 1024 / 1024;
     if (used > 400) {
-        console.log('⚠️ RAM too high (>400MB), restarting bot...');
-        process.exit(1);
+        console.warn(`[Windowseven MD Legacy] High memory warning: ${Math.round(used)}MB RSS`);
     }
 }, 30_000).unref();
 

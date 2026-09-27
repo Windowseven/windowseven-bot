@@ -35,6 +35,16 @@ function createTenantMiddleware({ tenantMembershipRepo, tenantRepo, auditLogRepo
             throw ApiError.notFound('Tenant not found', 'TENANT_NOT_FOUND');
         }
 
+        // 1b. Enforce tenant lifecycle status boundaries
+        if (tenant.status === 'DEACTIVATED') {
+            throw ApiError.forbidden('Tenant has been deactivated', 'TENANT_DEACTIVATED');
+        }
+
+        const isReadOperation = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+        if (tenant.status === 'SUSPENDED' && !isReadOperation) {
+            throw ApiError.forbidden('Tenant is suspended. Mutating operations are disabled.', 'TENANT_SUSPENDED');
+        }
+
         // 2. Authoritative membership verification against authenticated user
         const membership = await tenantMembershipRepo.findByTenantAndUser(tenantId, req.user.id);
         if (!membership) {
@@ -61,6 +71,7 @@ function createTenantMiddleware({ tenantMembershipRepo, tenantRepo, auditLogRepo
             role: membership.role,
             membershipId: membership.id,
             tenantName: tenant.name,
+            tenantStatus: tenant.status || 'ACTIVE',
         });
 
         if (typeof next === 'function') {

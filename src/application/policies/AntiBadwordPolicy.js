@@ -20,8 +20,10 @@ class AntiBadwordPolicy {
             return PolicyDecision.allow('AntiBadwordPolicy');
         }
 
-        // WhatsApp group admins are exempt
-        if (actor && actor.isSenderAdmin) {
+        // WhatsApp group admins are exempt if settings.exempt_admins is true (or default omitted)
+        // If settings.exempt_admins === false, group admins are subject to policy evaluation.
+        const exemptAdmins = groupPolicy.settings?.exempt_admins !== false;
+        if (actor && actor.isSenderAdmin && exemptAdmins) {
             return PolicyDecision.allow('AntiBadwordPolicy');
         }
 

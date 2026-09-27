@@ -19,8 +19,9 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
     let credsRepo;
     let manager;
 
-    let tenantA, tenantB;
-    let connA1, connA2, connB1;
+    let tenantA, tenantB, tenantC;
+    let connA1, connC1, connB1;
+    let fenceA1, fenceC1, fenceB1;
 
     before(async () => {
         pool = new Pool({ connectionString: TEST_DB_URL });
@@ -31,15 +32,18 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
         await migrateUp(pool);
         await pool.query('DELETE FROM tenants CASCADE;');
 
-        // Provision Tenant A with two connections
+        // Provision Tenant A with one connection
         tenantA = await tenantRepo.create({ name: 'CM Tenant A' });
         connA1 = await connRepo.createForTenant(tenantA.id, {
             phoneNumber: '255700000101',
             displayName: 'A1 Bot',
         });
-        connA2 = await connRepo.createForTenant(tenantA.id, {
+
+        // Provision Tenant C with one connection
+        tenantC = await tenantRepo.create({ name: 'CM Tenant C' });
+        connC1 = await connRepo.createForTenant(tenantC.id, {
             phoneNumber: '255700000102',
-            displayName: 'A2 Bot',
+            displayName: 'C1 Bot',
         });
 
         // Provision Tenant B with one connection
@@ -48,8 +52,23 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
             phoneNumber: '255700000201',
             displayName: 'B1 Bot',
         });
+        fenceA1 = await connRepo.acquireLease({ connectionId: connA1.id, tenantId: tenantA.id, workerId: 'cm-test-a1' });
+        fenceC1 = await connRepo.acquireLease({ connectionId: connC1.id, tenantId: tenantC.id, workerId: 'cm-test-c1' });
+        fenceB1 = await connRepo.acquireLease({ connectionId: connB1.id, tenantId: tenantB.id, workerId: 'cm-test-b1' });
 
-        manager = new ConnectionManager(pool);
+        const EventEmitter = require('node:events');
+        const createMockSocket = () => {
+            const ev = new EventEmitter();
+            return {
+                ev,
+                ws: { terminate: () => {} },
+                end: () => {},
+                sendMessage: async () => ({ key: { id: 'sent' } }),
+                groupMetadata: async () => ({ id: 'group', participants: [] }),
+            };
+        };
+
+        manager = new ConnectionManager(pool, { socketFactory: createMockSocket });
     });
 
     after(async () => {
@@ -61,6 +80,7 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
 
     it('should create and register a connection and synchronize database status', async () => {
         const runtimeConn = await manager.createConnection(tenantA.id, connA1.id, {
+            workerId: 'cm-test-a1', leaseEpoch: fenceA1.leaseEpoch,
             pairingCode: true,
             socketOverrides: {
                 // Keep socket offline/silent for unit testing
@@ -86,7 +106,7 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
     it('should reject duplicate registration of the same connection', async () => {
         await assert.rejects(
             async () => {
-                await manager.createConnection(tenantA.id, connA1.id);
+                await manager.createConnection(tenantA.id, connA1.id, { workerId: 'cm-test-a1', leaseEpoch: fenceA1.leaseEpoch });
             },
             /already registered/,
             'ConnectionManager must prevent registering the same connection twice'
@@ -97,22 +117,24 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
         // Attempting to register Conn B1 under Tenant A
         await assert.rejects(
             async () => {
-                await manager.createConnection(tenantA.id, connB1.id);
+                await manager.createConnection(tenantA.id, connB1.id, { workerId: 'cm-test-a1', leaseEpoch: fenceA1.leaseEpoch });
             },
             /not found for tenant/,
             'ConnectionManager must validate tenant ownership against PostgreSQL'
         );
     });
 
-    it('should isolate failures across multiple connections (A1 failure does not affect A2 or B1)', async () => {
-        // Register Connection A2
-        await manager.createConnection(tenantA.id, connA2.id, {
+    it('should isolate failures across multiple connections (A1 failure does not affect C1 or B1)', async () => {
+        // Register Connection C1
+        await manager.createConnection(tenantC.id, connC1.id, {
+            workerId: 'cm-test-c1', leaseEpoch: fenceC1.leaseEpoch,
             pairingCode: true,
             socketOverrides: { connectTimeoutMs: 1000 },
         });
 
         // Register Connection B1
         await manager.createConnection(tenantB.id, connB1.id, {
+            workerId: 'cm-test-b1', leaseEpoch: fenceB1.leaseEpoch,
             pairingCode: true,
             socketOverrides: { connectTimeoutMs: 1000 },
         });
@@ -127,10 +149,10 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
         const a1DbStatus = await connRepo.findByIdForTenant(connA1.id, tenantA.id);
         assert.strictEqual(a1DbStatus.status, 'DISCONNECTED');
 
-        // Verify Connection A2 is STILL registered, active, and untouched
-        assert.strictEqual(manager.hasConnection(connA2.id), true);
-        const a2 = manager.getConnection(connA2.id);
-        assert.strictEqual(a2.status, 'CONNECTING');
+        // Verify Connection C1 is STILL registered, active, and untouched
+        assert.strictEqual(manager.hasConnection(connC1.id), true);
+        const c1 = manager.getConnection(connC1.id);
+        assert.strictEqual(c1.status, 'CONNECTING');
 
         // Verify Connection B1 is STILL registered, active, and untouched
         assert.strictEqual(manager.hasConnection(connB1.id), true);
@@ -168,10 +190,15 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
     });
 
     it('should classify recoverable disconnect and schedule reconnect with backoff', async () => {
-        const connA2Runtime = manager.getConnection(connA2.id);
+        const connC1Runtime = manager.getConnection(connC1.id);
+        if (connC1Runtime.reconnectTimer) {
+            clearTimeout(connC1Runtime.reconnectTimer);
+            connC1Runtime.reconnectTimer = null;
+        }
+        connC1Runtime.reconnectAttempts = 0;
 
         // Simulate a recoverable connectionClosed event
-        await manager._handleConnectionUpdate(connA2Runtime, {
+        await manager._handleConnectionUpdate(connC1Runtime, {
             connection: 'close',
             lastDisconnect: {
                 error: {
@@ -183,13 +210,13 @@ describe('ConnectionManager Lifecycle, Reconnect & Failure Isolation', () => {
         });
 
         // Lifecycle moves to RECONNECTING and timer is scheduled
-        assert.strictEqual(connA2Runtime.lifecycleState, 'RECONNECTING');
-        assert.ok(connA2Runtime.reconnectTimer !== null);
-        assert.strictEqual(connA2Runtime.reconnectAttempts, 1);
+        assert.strictEqual(connC1Runtime.lifecycleState, 'RECONNECTING');
+        assert.ok(connC1Runtime.reconnectTimer !== null);
+        assert.strictEqual(connC1Runtime.reconnectAttempts, 1);
 
         // Clean up timer
-        clearTimeout(connA2Runtime.reconnectTimer);
-        connA2Runtime.reconnectTimer = null;
+        clearTimeout(connC1Runtime.reconnectTimer);
+        connC1Runtime.reconnectTimer = null;
     });
 
     it('should gracefully shutdown all connections and clear timers', async () => {

@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Windowseven — Operational Admin Dashboard</title>
+    <link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+    <div id="app" class="dashboard-layout">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="sidebar-brand">
+                <span class="brand-badge">W7</span>
+                <span class="brand-title">Windowseven Admin</span>
+            </div>
+            <nav class="sidebar-nav">
+                <a href="#overview" class="nav-item active" data-tab="overview">
+                    <span class="nav-icon">📊</span> Overview
+                </a>
+                <a href="#customers" class="nav-item" data-tab="customers">
+                    <span class="nav-icon">👥</span> Customers
+                </a>
+                <a href="#subscriptions" class="nav-item" data-tab="subscriptions">
+                    <span class="nav-icon">🔄</span> Subscriptions
+                </a>
+                <a href="#plans" class="nav-item" data-tab="plans">
+                    <span class="nav-icon">🏷️</span> Plans & Pricing
+                </a>
+                <a href="#payments" class="nav-item" data-tab="payments">
+                    <span class="nav-icon">💳</span> Payments
+                </a>
+                <a href="#groups" class="nav-item" data-tab="groups">
+                    <span class="nav-icon">💬</span> Groups
+                </a>
+                <a href="#audit" class="nav-item" data-tab="audit">
+                    <span class="nav-icon">🛡️</span> Audit Logs
+                </a>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="admin-identity">
+                    <span class="admin-avatar">👤</span>
+                    <div class="admin-details">
+                        <span id="current-admin-email" class="admin-email">Admin</span>
+                        <span class="admin-role-badge">OPERATIONAL AUTHORITY</span>
+                    </div>
+                </div>
+                <button id="btn-logout" class="btn-sm btn-outline">Logout</button>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Topbar -->
+            <header class="topbar">
+                <div class="topbar-title">
+                    <h1 id="page-title">Overview</h1>
+                    <span class="system-status-indicator"><span class="dot"></span> Systems Operational</span>
+                </div>
+                <div class="topbar-actions">
+                    <button id="btn-refresh" class="btn btn-secondary">↻ Refresh</button>
+                </div>
+            </header>
+
+            <div class="content-body">
+                <!-- Notifications Banner -->
+                <div id="alert-banner" class="alert-banner hidden"></div>
+
+                <!-- TAB: OVERVIEW -->
+                <section id="tab-overview" class="tab-pane active">
+                    <div class="metrics-grid">
+                        <div class="metric-card">
+                            <span class="metric-label">Total Customers</span>
+                            <span id="metric-total-customers" class="metric-value">-</span>
+                            <span class="metric-sub" id="metric-customer-breakdown">Active: - | Suspended: -</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">Active Subscriptions</span>
+                            <span id="metric-active-subs" class="metric-value highlight-green">-</span>
+                            <span class="metric-sub" id="metric-expiring-soon">Expiring (72h): -</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">WhatsApp Connections</span>
+                            <span id="metric-connections" class="metric-value highlight-blue">-</span>
+                            <span class="metric-sub" id="metric-connections-sub">Connected: -</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">30-Day Revenue</span>
+                            <span id="metric-revenue" class="metric-value">-</span>
+                            <span class="metric-sub" id="metric-payments-count">Successful Payments: -</span>
+                        </div>
+                    </div>
+
+                    <div class="dashboard-split">
+                        <div class="panel">
+                            <div class="panel-header">
+                                <h2>Recent System Activity</h2>
+                            </div>
+                            <div class="panel-body">
+                                <ul id="overview-recent-activity" class="activity-feed">
+                                    <li class="loading-item">Loading activity feed...</li>
+                                </ul>
+                            </div>
+                        </div>
+                        <div class="panel">
+                            <div class="panel-header">
+                                <h2>Quick Administration</h2>
+                            </div>
+                            <div class="panel-body quick-actions">
+                                <button class="btn btn-primary" onclick="window.AdminApp.showNewPlanModal()">+ Create New Plan</button>
+                                <button class="btn btn-secondary" onclick="window.AdminApp.navigate('customers')">Manage Customers</button>
+                                <button class="btn btn-secondary" onclick="window.AdminApp.navigate('subscriptions')">Inspect Expiring Subscriptions</button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB: CUSTOMERS -->
+                <section id="tab-customers" class="tab-pane">
+                    <div class="table-controls">
+                        <div class="search-box">
+                            <input type="text" id="customers-search" placeholder="Search by phone, email, or name..." autocomplete="off">
+                            <button id="btn-search-customers" class="btn btn-secondary">Search</button>
+                        </div>
+                        <div class="filter-box">
+                            <select id="customers-status-filter">
+                                <option value="">All Statuses</option>
+                                <option value="ACTIVE">ACTIVE</option>
+                                <option value="SUSPENDED">SUSPENDED</option>
+                                <option value="DEACTIVATED">DEACTIVATED</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Customer / Tenant</th>
+                                    <th>Registered Phone</th>
+                                    <th>Email</th>
+                                    <th>Status</th>
+                                    <th>Active Subscription</th>
+                                    <th>Connections</th>
+                                    <th>Groups</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="customers-table-body">
+                                <tr><td colspan="8" class="text-center">Loading customers...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- TAB: SUBSCRIPTIONS -->
+                <section id="tab-subscriptions" class="tab-pane">
+                    <div class="table-controls">
+                        <div class="filter-box">
+                            <select id="subs-status-filter">
+                                <option value="">All Statuses</option>
+                                <option value="ACTIVE">ACTIVE</option>
+                                <option value="MANUALLY_GRANTED">MANUALLY_GRANTED</option>
+                                <option value="EXPIRED">EXPIRED</option>
+                                <option value="CANCELLED">CANCELLED</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Customer</th>
+                                    <th>Plan</th>
+                                    <th>Price Paid</th>
+                                    <th>Duration</th>
+                                    <th>Status</th>
+                                    <th>Expires At</th>
+                                    <th>Created At</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="subs-table-body">
+                                <tr><td colspan="8" class="text-center">Loading subscriptions...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- TAB: PLANS & PRICING -->
+                <section id="tab-plans" class="tab-pane">
+                    <div class="section-actions">
+                        <button class="btn btn-primary" onclick="window.AdminApp.showNewPlanModal()">+ Add New Plan</button>
+                    </div>
+
+                    <div class="plans-grid" id="plans-container">
+                        <div class="loading-item">Loading plans...</div>
+                    </div>
+                </section>
+
+                <!-- TAB: PAYMENTS -->
+                <section id="tab-payments" class="tab-pane">
+                    <div class="table-controls">
+                        <div class="filter-box">
+                            <select id="payments-status-filter">
+                                <option value="">All Statuses</option>
+                                <option value="SUCCESS">SUCCESS</option>
+                                <option value="PENDING">PENDING</option>
+                                <option value="FAILED">FAILED</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Reference</th>
+                                    <th>Customer Phone / Email</th>
+                                    <th>Plan</th>
+                                    <th>Amount</th>
+                                    <th>Provider</th>
+                                    <th>Status</th>
+                                    <th>Created At</th>
+                                </tr>
+                            </thead>
+                            <tbody id="payments-table-body">
+                                <tr><td colspan="7" class="text-center">Loading payment records...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- TAB: GROUPS -->
+                <section id="tab-groups" class="tab-pane">
+                    <div class="table-controls">
+                        <div class="search-box">
+                            <input type="text" id="groups-search" placeholder="Search group name or JID..." autocomplete="off">
+                            <button id="btn-search-groups" class="btn btn-secondary">Search</button>
+                        </div>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Group Name</th>
+                                    <th>Group JID</th>
+                                    <th>Customer</th>
+                                    <th>Connection State</th>
+                                    <th>Member Count</th>
+                                    <th>Joined At</th>
+                                </tr>
+                            </thead>
+                            <tbody id="groups-table-body">
+                                <tr><td colspan="6" class="text-center">Loading managed groups...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- TAB: AUDIT LOGS -->
+                <section id="tab-audit" class="tab-pane">
+                    <div class="table-wrapper">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Action</th>
+                                    <th>Actor</th>
+                                    <th>Target</th>
+                                    <th>Reason / Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="audit-table-body">
+                                <tr><td colspan="5" class="text-center">Loading immutable audit logs...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- MODAL: CUSTOMER DETAIL -->
+    <div id="modal-customer" class="modal hidden">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-header">
+                <h3 id="cust-modal-title">Customer Detail</h3>
+                <button class="modal-close" onclick="window.AdminApp.closeModal('modal-customer')">&times;</button>
+            </div>
+            <div class="modal-body" id="cust-modal-body">
+                Loading customer...
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="window.AdminApp.closeModal('modal-customer')">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: ACTION WITH REASON (Suspend, Reactivate, Deactivate, Extend, Grant) -->
+    <div id="modal-reason-action" class="modal hidden">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3 id="reason-modal-title">Administrative Action</h3>
+                <button class="modal-close" onclick="window.AdminApp.closeModal('modal-reason-action')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="reason-modal-prompt">Please enter the mandatory reason for this action:</p>
+                <div id="reason-modal-extra-fields"></div>
+                <div class="form-group">
+                    <label for="action-reason-input">Reason (Mandatory & Audited):</label>
+                    <textarea id="action-reason-input" class="form-control" rows="3" placeholder="Explain the operational rationale..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="window.AdminApp.closeModal('modal-reason-action')">Cancel</button>
+                <button id="btn-submit-reason-action" class="btn btn-primary">Confirm Action</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: PLAN EDITOR -->
+    <div id="modal-plan" class="modal hidden">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3 id="plan-modal-title">Create Subscription Plan</h3>
+                <button class="modal-close" onclick="window.AdminApp.closeModal('modal-plan')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="plan-form-id">
+                <div class="form-group">
+                    <label for="plan-name">Plan Name:</label>
+                    <input type="text" id="plan-name" class="form-control" placeholder="e.g. Standard 30 Days">
+                </div>
+                <div class="form-group">
+                    <label for="plan-price">Authoritative Price:</label>
+                    <input type="number" id="plan-price" class="form-control" min="0" step="100" placeholder="e.g. 5000">
+                </div>
+                <div class="form-group">
+                    <label for="plan-currency">Currency:</label>
+                    <input type="text" id="plan-currency" class="form-control" value="TZS" maxlength="10">
+                </div>
+                <div class="form-group">
+                    <label for="plan-duration">Duration (Days):</label>
+                    <input type="number" id="plan-duration" class="form-control" min="1" step="1" value="30">
+                </div>
+                <div class="form-group">
+                    <label for="plan-description">Description:</label>
+                    <textarea id="plan-description" class="form-control" rows="2" placeholder="Brief plan details"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="plan-status">Status:</label>
+                    <select id="plan-status" class="form-control">
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="INACTIVE">INACTIVE</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="window.AdminApp.closeModal('modal-plan')">Cancel</button>
+                <button id="btn-save-plan" class="btn btn-primary">Save Plan</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: ADMIN LOGIN -->
+    <div id="modal-login" class="modal hidden">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3>Admin Authentication</h3>
+            </div>
+            <div class="modal-body">
+                <div id="login-error-banner" class="alert-banner alert-danger hidden"></div>
+                <div class="form-group">
+                    <label for="login-identifier">Phone or Email:</label>
+                    <input type="text" id="login-identifier" class="form-control" placeholder="e.g. 0766183998 or admin@windowseven.bot">
+                </div>
+                <div class="form-group">
+                    <label for="login-password">Password:</label>
+                    <input type="password" id="login-password" class="form-control" placeholder="Admin password">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-do-login" class="btn btn-primary">Sign In as Admin</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/admin/admin.js"></script>
+</body>
+</html>

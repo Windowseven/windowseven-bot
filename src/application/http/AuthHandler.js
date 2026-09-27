@@ -193,8 +193,20 @@ function createAuthHandler({
             return authRateLimiter(req, res, async () => {
                 try {
                     const body = await readJsonBody(req);
+                    const phoneNumber = body.phoneNumber || body.phone || body.phone_number || null;
+                    if (!phoneNumber) {
+                        return sendError(res, 400, 'VALIDATION_ERROR', 'A valid Tanzanian phone number (+255XXXXXXXXX) is required');
+                    }
+                    if (!body.email) {
+                        return sendError(res, 400, 'VALIDATION_ERROR', 'A valid email address is required');
+                    }
+                    if (!body.password) {
+                        return sendError(res, 400, 'VALIDATION_ERROR', 'Password is required');
+                    }
+
                     const result = await authService.register({
                         email: body.email,
+                        phoneNumber,
                         password: body.password,
                         ipAddress,
                         userAgent,
@@ -214,8 +226,13 @@ function createAuthHandler({
             return authRateLimiter(req, res, async () => {
                 try {
                     const body = await readJsonBody(req);
+                    const phoneNumber = body.phoneNumber || body.phone || body.phone_number || null;
+                    const identifier = body.identifier || null;
+
                     const result = await authService.login({
                         email: body.email,
+                        phoneNumber,
+                        identifier,
                         password: body.password,
                         ipAddress,
                         userAgent,

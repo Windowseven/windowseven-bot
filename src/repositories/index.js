@@ -15,6 +15,12 @@ const WorkerRepository = require('./WorkerRepository');
 const { IdempotencyRepository, computeRequestHash } = require('./IdempotencyRepository');
 const ConnectionCommandRepository = require('./ConnectionCommandRepository');
 const ScheduledModerationTaskRepository = require('./ScheduledModerationTaskRepository');
+const PlatformRoleRepository = require('./PlatformRoleRepository');
+const PlatformAuditRepository = require('./PlatformAuditRepository');
+const { PlatformIdempotencyRepository, computePlatformRequestHash } = require('./PlatformIdempotencyRepository');
+const PlanRepository = require('./PlanRepository');
+const SubscriptionRepository = require('./SubscriptionRepository');
+const PaymentRepository = require('./PaymentRepository');
 
 module.exports = {
     UserRepository,
@@ -33,4 +39,11 @@ module.exports = {
     computeRequestHash,
     ConnectionCommandRepository,
     ScheduledModerationTaskRepository,
+    PlatformRoleRepository,
+    PlatformAuditRepository,
+    PlatformIdempotencyRepository,
+    computePlatformRequestHash,
+    PlanRepository,
+    SubscriptionRepository,
+    PaymentRepository,
 };

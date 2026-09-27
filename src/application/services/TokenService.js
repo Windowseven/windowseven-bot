@@ -22,6 +22,7 @@ class TokenService {
         this.audience = options.audience || process.env.JWT_AUDIENCE || 'windowseven-api';
         this.accessTokenTtl = options.accessTokenTtlSeconds || parseInt(process.env.ACCESS_TOKEN_TTL || '900', 10);
         this.refreshTokenTtl = options.refreshTokenTtlSeconds || parseInt(process.env.REFRESH_TOKEN_TTL || '604800', 10);
+        this.clock = typeof options.clock === 'function' ? options.clock : () => Date.now();
 
         if (options.privateKey && options.publicKey) {
             this.privateKey = typeof options.privateKey === 'string'
@@ -77,7 +78,7 @@ class TokenService {
             throw new Error('userId and email are required to issue an access token');
         }
 
-        const now = Math.floor(Date.now() / 1000);
+        const now = Math.floor(this.clock() / 1000);
         const header = {
             alg: 'EdDSA',
             typ: 'JWT',
@@ -153,7 +154,7 @@ class TokenService {
         }
 
         // Claims validation
-        const now = Math.floor(Date.now() / 1000);
+        const now = Math.floor(this.clock() / 1000);
 
         if (!payload.exp || payload.exp <= now) {
             return { valid: false, error: 'Token has expired' };

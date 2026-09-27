@@ -108,6 +108,17 @@ class WorkerRepository {
         const { rows } = await this.pool.query(sql, [String(staleThresholdSeconds)]);
         return rows.map((r) => r.id);
     }
+
+    async listAll({ limit = 50, offset = 0 } = {}) {
+        const sql = `
+            SELECT *
+            FROM workers
+            ORDER BY created_at ASC
+            LIMIT $1 OFFSET $2;
+        `;
+        const { rows } = await this.pool.query(sql, [limit, offset]);
+        return rows.map((r) => this._mapRow(r));
+    }
 }
 
 module.exports = WorkerRepository;

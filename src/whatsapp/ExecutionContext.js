@@ -15,7 +15,7 @@
  * @param {object} [params.repositories] - Optional domain repositories
  * @returns {Readonly<{ tenantId: string, connectionId: string, sock: object, db: import('pg').Pool, repositories: object }>}
  */
-function createExecutionContext({ tenantId, connectionId, socket, sock, pool, db, repositories = {} }) {
+function createExecutionContext({ tenantId, connectionId, workerId = null, leaseEpoch = null, socket, sock, pool, db, repositories = {} }) {
     if (!tenantId || typeof tenantId !== 'string') {
         throw new Error('[ExecutionContext] Valid tenantId is required');
     }
@@ -29,6 +29,8 @@ function createExecutionContext({ tenantId, connectionId, socket, sock, pool, db
     return Object.freeze({
         tenantId,
         connectionId,
+        workerId,
+        leaseEpoch,
         sock: resolvedSocket,
         db: resolvedPool,
         repositories: Object.freeze({ ...repositories }),

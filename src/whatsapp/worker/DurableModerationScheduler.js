@@ -1,4 +1,5 @@
 const WhatsAppModerationGateway = require('../../gateways/WhatsAppModerationGateway');
+const { defaultMetricsRegistry } = require('../../application/metrics/MetricsRegistry');
 
 class DurableModerationScheduler {
     constructor({
@@ -9,6 +10,7 @@ class DurableModerationScheduler {
         groupRepo,
         auditLogRepo = null,
         eventPublisher = null,
+        metricsRegistry = null,
         workerId,
         pollIntervalMs = 5000,
     }) {
@@ -22,6 +24,7 @@ class DurableModerationScheduler {
         this.groupRepo = groupRepo;
         this.auditLogRepo = auditLogRepo;
         this.eventPublisher = eventPublisher;
+        this.metricsRegistry = metricsRegistry || defaultMetricsRegistry;
         this.workerId = workerId;
         this.pollIntervalMs = pollIntervalMs;
         this.timer = null;
@@ -58,6 +61,7 @@ class DurableModerationScheduler {
     }
 
     async sweepAndExecute() {
+        if (this.isStopped) return;
         // Collect currently active leased connection IDs
         const connectionIds = Array.from(this.leaseManager.leases.keys());
         if (connectionIds.length === 0) return;
@@ -113,6 +117,10 @@ class DurableModerationScheduler {
             console.log(`[DurableModerationScheduler ${this.workerId}] Task ${id} was cancelled before execution. Aborting.`);
             return;
         }
+        if (fresh?.status === 'PAUSED') {
+            console.log(`[DurableModerationScheduler ${this.workerId}] Task ${id} was paused before execution. Aborting.`);
+            return;
+        }
 
         // 3. Group and connection relational invariant & status check
         const group = await this.groupRepo.findByIdForTenant(groupId, tenantId);
@@ -126,13 +134,16 @@ class DurableModerationScheduler {
                 });
                 return;
             }
-            await this.taskRepo.failTask(null, {
+            const failed = await this.taskRepo.failTask(null, {
                 id,
                 workerId: this.workerId,
                 claimEpoch,
                 error: 'GROUP_NOT_MANAGED_OR_MISMATCHED',
                 isTerminal: true,
             });
+            if (failed) {
+                this.metricsRegistry?.scheduledTasksTotal?.inc({ type: action, status: 'FAILED' });
+            }
             return;
         }
 
@@ -152,9 +163,12 @@ class DurableModerationScheduler {
         }
 
         // 5. Execute side effect on WhatsApp (At-least-once delivery; repeat-safe)
+        let remoteOperationStarted = false;
         try {
             if (action === 'UNMUTE_GROUP') {
                 const gateway = new WhatsAppModerationGateway(sock);
+                if (!await this.taskRepo.markRemoteStarted(null, { id, workerId: this.workerId, claimEpoch })) return;
+                remoteOperationStarted = true;
                 await gateway.unmuteGroup(group.whatsapp_jid);
                 await gateway.sendTextMessage(group.whatsapp_jid, '*_The group has been unmuted._*');
             }
@@ -167,6 +181,7 @@ class DurableModerationScheduler {
             });
 
             if (completed) {
+                this.metricsRegistry?.scheduledTasksTotal?.inc({ type: action, status: 'COMPLETED' });
                 if (this.auditLogRepo) {
                     await this.auditLogRepo.create({
                         tenantId,
@@ -188,7 +203,15 @@ class DurableModerationScheduler {
             }
         } catch (err) {
             console.error(`[DurableModerationScheduler ${this.workerId}] Error executing task ${id}:`, err.message);
-            await this.taskRepo.failTask(null, {
+            if (remoteOperationStarted) {
+                // Do NOT increment terminal metrics on REMOTE_OUTCOME_UNKNOWN!
+                // REMOTE_OUTCOME_UNKNOWN is an in-flight intermediate state.
+                // The authoritative terminal metric will be recorded when resolved (COMPLETED/FAILED)
+                // by RemoteOutcomeVerificationService or PlatformService.forceFailTask.
+                await this.taskRepo.markRemoteOutcomeUnknown(null, { id, workerId: this.workerId, claimEpoch, error: 'REMOTE_OUTCOME_UNKNOWN' });
+                return;
+            }
+            const failRes = await this.taskRepo.failTask(null, {
                 id,
                 workerId: this.workerId,
                 claimEpoch,
@@ -196,6 +219,9 @@ class DurableModerationScheduler {
                 isTerminal: false,
                 backoffSeconds: 10,
             });
+            if (failRes === 'FAILED') {
+                this.metricsRegistry?.scheduledTasksTotal?.inc({ type: action, status: 'FAILED' });
+            }
         }
     }
 }

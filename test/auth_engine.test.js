@@ -24,6 +24,7 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
     let passwordService, tokenService, authService;
     let server, serverUrl;
     let rateLimiter;
+    let simulatedTime = Date.now();
 
     before(async () => {
         pool = new Pool({ connectionString: TEST_DB_URL });
@@ -38,6 +39,7 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
             audience: 'windowseven-test-api',
             accessTokenTtlSeconds: 2, // 2 seconds for expiration testing
             refreshTokenTtlSeconds: 10,
+            clock: () => simulatedTime,
         });
 
         authService = new AuthService({
@@ -81,6 +83,7 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
     });
 
     beforeEach(async () => {
+        simulatedTime = Date.now();
         if (rateLimiter) rateLimiter.reset();
     });
 
@@ -172,8 +175,8 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
                 email: 'user1@testauth.com',
             });
 
-            // Wait 2.1s for token to expire (TTL was configured to 2s)
-            await new Promise((r) => setTimeout(r, 2100));
+            // Advance clock by 3 seconds (exceeding 2s TTL)
+            simulatedTime += 3000;
 
             const decoded = tokenService.verifyAccessToken(token);
             assert.strictEqual(decoded.valid, false);
@@ -218,6 +221,7 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
             const res = await request('POST', '/api/v1/auth/register', {
                 body: {
                     email: 'reg1@testauth.com',
+                    phoneNumber: '+255711000001',
                     password: 'SuperSecretPassword123!',
                 },
             });
@@ -225,6 +229,7 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
             assert.strictEqual(res.status, 201);
             assert.strictEqual(res.body.success, true);
             assert.strictEqual(res.body.data.user.email, 'reg1@testauth.com');
+            assert.strictEqual(res.body.data.user.phoneNumber, '+255711000001');
             assert.ok(res.body.data.user.id, 'Must return generated UUID');
             assert.strictEqual(res.body.data.user.password, undefined);
             assert.strictEqual(res.body.data.user.password_hash, undefined);
@@ -243,6 +248,7 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
             const res = await request('POST', '/api/v1/auth/register', {
                 body: {
                     email: 'not-an-email',
+                    phoneNumber: '+255711000002',
                     password: 'SuperSecretPassword123!',
                 },
             });
@@ -255,6 +261,7 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
             const res = await request('POST', '/api/v1/auth/register', {
                 body: {
                     email: 'weakpass@testauth.com',
+                    phoneNumber: '+255711000003',
                     password: 'short',
                 },
             });
@@ -268,6 +275,7 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
             await request('POST', '/api/v1/auth/register', {
                 body: {
                     email: 'casecheck@testauth.com',
+                    phoneNumber: '+255711000004',
                     password: 'SuperSecretPassword123!',
                 },
             });
@@ -276,12 +284,51 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
             const res = await request('POST', '/api/v1/auth/register', {
                 body: {
                     email: 'CASECHECK@testauth.com',
+                    phoneNumber: '+255711000005',
                     password: 'SuperSecretPassword123!',
                 },
             });
 
             assert.strictEqual(res.status, 409);
             assert.strictEqual(res.body.error.code, 'EMAIL_ALREADY_EXISTS');
+        });
+
+        it('3.5 should reject missing phone number', async () => {
+            const res = await request('POST', '/api/v1/auth/register', {
+                body: {
+                    email: 'nophone@testauth.com',
+                    password: 'SuperSecretPassword123!',
+                },
+            });
+
+            assert.strictEqual(res.status, 400);
+            assert.strictEqual(res.body.error.code, 'VALIDATION_ERROR');
+        });
+
+        it('3.6 should reject invalid phone number', async () => {
+            const res = await request('POST', '/api/v1/auth/register', {
+                body: {
+                    email: 'invalidphone@testauth.com',
+                    phoneNumber: '+1234567890',
+                    password: 'SuperSecretPassword123!',
+                },
+            });
+
+            assert.strictEqual(res.status, 400);
+            assert.strictEqual(res.body.error.code, 'VALIDATION_ERROR');
+        });
+
+        it('3.7 should reject duplicate phone number with 409', async () => {
+            const res = await request('POST', '/api/v1/auth/register', {
+                body: {
+                    email: 'diffemail@testauth.com',
+                    phoneNumber: '+255711000001', // already used in 3.1
+                    password: 'SuperSecretPassword123!',
+                },
+            });
+
+            assert.strictEqual(res.status, 409);
+            assert.strictEqual(res.body.error.code, 'PHONE_ALREADY_EXISTS');
         });
     });
 
@@ -369,6 +416,30 @@ describe('Phase 4B: Authentication Engine & User Identity', () => {
             const lastRes = results[results.length - 1];
             assert.strictEqual(lastRes.status, 429);
             assert.strictEqual(lastRes.body.error.code, 'RATE_LIMITED');
+        });
+
+        it('4.5 should reject phone number login attempt (prohibited)', async () => {
+            const res = await request('POST', '/api/v1/auth/login', {
+                body: {
+                    phoneNumber: '+255711000001',
+                    password: 'LoginPassword123!',
+                },
+            });
+
+            assert.strictEqual(res.status, 401);
+            assert.strictEqual(res.body.error.code, 'INVALID_CREDENTIALS');
+        });
+
+        it('4.6 should reject identifier when using phone number', async () => {
+            const res = await request('POST', '/api/v1/auth/login', {
+                body: {
+                    identifier: '+255711000001',
+                    password: 'LoginPassword123!',
+                },
+            });
+
+            assert.strictEqual(res.status, 401);
+            assert.strictEqual(res.body.error.code, 'INVALID_CREDENTIALS');
         });
     });
 

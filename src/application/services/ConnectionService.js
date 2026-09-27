@@ -1,5 +1,6 @@
 const ApiError = require('../errors/ApiError');
 const { defaultQrStore } = require('../../whatsapp/control/EphemeralQrStore');
+const { defaultPairingCodeStore } = require('../../whatsapp/control/EphemeralPairingCodeStore');
 const { defaultCommandGateway } = require('../../whatsapp/control/ConnectionCommandGateway');
 
 /**
@@ -14,6 +15,7 @@ class ConnectionService {
      * @param {import('../../repositories/AuditLogRepository')} [params.auditLogRepo]
      * @param {import('../../whatsapp/control/ConnectionCommandGateway').ConnectionCommandGateway} [params.commandGateway]
      * @param {import('../../whatsapp/control/EphemeralQrStore').EphemeralQrStore} [params.qrStore]
+     * @param {import('../../whatsapp/control/EphemeralPairingCodeStore').EphemeralPairingCodeStore} [params.pairingStore]
      */
     constructor({
         pool,
@@ -21,6 +23,7 @@ class ConnectionService {
         auditLogRepo = null,
         commandGateway = defaultCommandGateway,
         qrStore = defaultQrStore,
+        pairingStore = defaultPairingCodeStore,
     }) {
         if (!pool || !connRepo) {
             throw new Error('pool and connRepo are required for ConnectionService');
@@ -30,6 +33,7 @@ class ConnectionService {
         this.auditLogRepo = auditLogRepo;
         this.commandGateway = commandGateway;
         this.qrStore = qrStore;
+        this.pairingStore = pairingStore;
     }
 
     /**
@@ -42,7 +46,7 @@ class ConnectionService {
         actorUserId = null,
         ipAddress = null,
         userAgent = null,
-    }) {
+    }, client = null) {
         if (!tenantId) {
             throw ApiError.badRequest('tenantId is required', 'VALIDATION_ERROR');
         }
@@ -53,7 +57,7 @@ class ConnectionService {
             status: 'CREATED',
             desiredState: 'STOPPED',
             actualState: 'UNASSIGNED',
-        });
+        }, client);
 
         if (this.auditLogRepo) {
             await this.auditLogRepo.create({
@@ -68,7 +72,7 @@ class ConnectionService {
                 },
                 ipAddress,
                 userAgent,
-            }).catch(() => {});
+            }, client).catch(() => {});
         }
 
         return connection;
@@ -319,6 +323,210 @@ class ConnectionService {
         }
 
         return qrEntry;
+    }
+
+    /**
+     * Customer-scoped: Retrieves the customer's single WhatsApp connection.
+     * Enforces anti-enumeration and returns null if no connection is provisioned.
+     *
+     * @param {string} tenantId
+     * @returns {Promise<object|null>}
+     */
+    async getCustomerConnection(tenantId) {
+        if (!tenantId) throw ApiError.badRequest('tenantId is required', 'VALIDATION_ERROR');
+
+        const connection = await this.connRepo.findByTenantId(tenantId);
+        if (!connection) {
+            return null;
+        }
+
+        const qrInfo = this.qrStore.get(tenantId, connection.id, connection.leaseEpoch);
+        const pairingInfo = this.pairingStore.get(tenantId, connection.id, connection.leaseEpoch);
+
+        return {
+            id: connection.id,
+            tenantId: connection.tenantId,
+            phoneNumber: connection.phoneNumber,
+            displayName: connection.displayName,
+            status: connection.status,
+            desiredState: connection.desiredState,
+            actualState: connection.actualState,
+            assignedWorkerId: connection.assignedWorkerId,
+            leaseEpoch: connection.leaseEpoch,
+            hasActiveQr: Boolean(qrInfo),
+            qrExpiresAt: qrInfo?.expiresAt || null,
+            hasActivePairingCode: Boolean(pairingInfo),
+            pairingExpiresAt: pairingInfo?.expiresAt || null,
+            createdAt: connection.createdAt,
+            updatedAt: connection.updatedAt,
+        };
+    }
+
+    /**
+     * Customer-scoped: Gets or creates the customer's single connection and sets desired_state to RUNNING.
+     * Invariant: One connection per customer tenant.
+     *
+     * @param {object} params
+     * @param {string} params.tenantId
+     * @param {string} [params.phoneNumber]
+     * @param {string} [params.displayName]
+     * @param {string} [params.actorUserId]
+     * @param {string} [params.ipAddress]
+     * @param {string} [params.userAgent]
+     * @returns {Promise<object>}
+     */
+    async getOrCreateCustomerConnection({
+        tenantId,
+        phoneNumber = null,
+        displayName = null,
+        actorUserId = null,
+        ipAddress = null,
+        userAgent = null,
+    }) {
+        if (!tenantId) throw ApiError.badRequest('tenantId is required', 'VALIDATION_ERROR');
+
+        // Check if connection already exists for tenant
+        let connection = await this.connRepo.findByTenantId(tenantId);
+
+        if (!connection) {
+            try {
+                connection = await this.connRepo.createForTenant(tenantId, {
+                    phoneNumber,
+                    displayName: displayName || 'Customer Bot',
+                    status: 'CREATED',
+                    desiredState: 'RUNNING',
+                    actualState: 'UNASSIGNED',
+                });
+
+                if (this.auditLogRepo) {
+                    await this.auditLogRepo.create({
+                        tenantId,
+                        actorUserId,
+                        action: 'CUSTOMER_CONNECTION_PROVISIONED',
+                        resourceType: 'WhatsAppConnection',
+                        resourceId: connection.id,
+                        metadata: { displayName: connection.displayName, phoneNumber },
+                        ipAddress,
+                        userAgent,
+                    }).catch(() => {});
+                }
+            } catch (err) {
+                // If concurrent insert occurred, handle unique constraint race
+                if (err.code === '23505' || err.message.includes('unique')) {
+                    connection = await this.connRepo.findByTenantId(tenantId);
+                } else {
+                    throw err;
+                }
+            }
+        }
+
+        // If connection exists and desiredState is not RUNNING, transition to RUNNING
+        if (connection.desiredState !== 'RUNNING') {
+            connection = await this.connRepo.updateDesiredStateForTenant(connection.id, tenantId, 'RUNNING');
+
+            if (this.auditLogRepo) {
+                await this.auditLogRepo.create({
+                    tenantId,
+                    actorUserId,
+                    action: 'CUSTOMER_CONNECTION_STARTED',
+                    resourceType: 'WhatsAppConnection',
+                    resourceId: connection.id,
+                    metadata: { previousDesiredState: 'STOPPED', newDesiredState: 'RUNNING' },
+                    ipAddress,
+                    userAgent,
+                }).catch(() => {});
+            }
+        }
+
+        // Wake up worker control plane to reconcile/acquire
+        await this.commandGateway.sendCommand({
+            command: 'START_CONNECTION',
+            tenantId,
+            connectionId: connection.id,
+        }).catch(() => {});
+
+        return this.getCustomerConnection(tenantId);
+    }
+
+    /**
+     * Customer-scoped: Requests an ephemeral pairing code for the customer's active connection.
+     *
+     * @param {object} params
+     * @param {string} params.tenantId
+     * @param {string} params.phoneNumber
+     * @param {string} [params.actorUserId]
+     * @returns {Promise<{ code: string, expiresAt: string }>}
+     */
+    async requestCustomerPairingCode({
+        tenantId,
+        phoneNumber,
+        actorUserId = null,
+        ipAddress = null,
+        userAgent = null,
+    }) {
+        if (!tenantId) throw ApiError.badRequest('tenantId is required', 'VALIDATION_ERROR');
+        if (!phoneNumber) throw ApiError.badRequest('phoneNumber is required', 'VALIDATION_ERROR');
+
+        const connection = await this.connRepo.findByTenantId(tenantId);
+        if (!connection) {
+            throw ApiError.notFound('Connection not found for customer account', 'CONNECTION_NOT_FOUND');
+        }
+
+        // Must have assigned worker and active lease
+        if (!connection.assignedWorkerId || !connection.leaseEpoch) {
+            throw ApiError.badRequest(
+                'WhatsApp connection is not currently active on a worker. Please start the connection first.',
+                'CONNECTION_NOT_ACTIVE'
+            );
+        }
+
+        const workerNode = this.commandGateway.getWorkerNode ? this.commandGateway.getWorkerNode(connection.assignedWorkerId) : null;
+        if (!workerNode) {
+            throw ApiError.badRequest(
+                'The worker handling this connection is currently offline or unreachable. Please try again shortly.',
+                'WORKER_UNAVAILABLE'
+            );
+        }
+
+        let code;
+        try {
+            code = await workerNode.requestPairingCode(connection.id, phoneNumber);
+        } catch (err) {
+            if (err.code === 'CONNECTION_NOT_LEASED_BY_WORKER' || err.code === 'STALE_LEASE_EPOCH') {
+                throw ApiError.conflict('Worker lease expired or generation changed. Please retry.', 'STALE_LEASE');
+            }
+            if (err.code === 'SOCKET_UNAVAILABLE') {
+                throw ApiError.badRequest('WhatsApp socket is not connected or ready for pairing code.', 'SOCKET_UNAVAILABLE');
+            }
+            if (err.code === 'INVALID_PHONE_NUMBER') {
+                throw ApiError.badRequest('Invalid phone number format for pairing code.', 'INVALID_PHONE_NUMBER');
+            }
+            throw ApiError.internal(`Failed requesting pairing code: ${err.message}`);
+        }
+
+        // Store pairing code ephemerally with 120s TTL and current leaseEpoch
+        this.pairingStore.set(tenantId, connection.id, code, 120, connection.leaseEpoch);
+
+        if (this.auditLogRepo) {
+            await this.auditLogRepo.create({
+                tenantId,
+                actorUserId,
+                action: 'PAIRING_CODE_REQUESTED',
+                resourceType: 'WhatsAppConnection',
+                resourceId: connection.id,
+                metadata: {
+                    phoneNumber: String(phoneNumber).replace(/.(?=.{4})/g, '*'), // Masked phone for privacy
+                    leaseEpoch: connection.leaseEpoch,
+                },
+                ipAddress,
+                userAgent,
+            }).catch(() => {});
+        }
+
+        return {
+            code,
+            expiresAt: new Date(Date.now() + 120 * 1000).toISOString(),
+        };
     }
 }
 

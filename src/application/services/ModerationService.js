@@ -2,18 +2,27 @@ class ModerationService {
     /**
      * @param {object} params
      * @param {import('../../gateways/WhatsAppModerationGateway')} params.gateway
+     * @param {import('../../repositories/ScheduledModerationTaskRepository')} [params.taskRepo]
+     * @param {import('pg').Pool} [params.pool]
+     * @param {import('../../repositories/ConnectionCommandRepository')} [params.commandRepo]
+     * @param {object} [params.commandGateway]
      */
-    constructor({ gateway }) {
+    constructor({ gateway, taskRepo = null, pool = null, commandRepo = null, commandGateway = null }) {
         if (!gateway) throw new Error('[ModerationService] gateway is required');
         this.gateway = gateway;
-        this.activeMuteTimers = new Map(); // groupJid -> timerId (in-memory, ephemeral)
+        this.taskRepo = taskRepo;
+        this.pool = pool;
+        this.commandRepo = commandRepo;
+        this.commandGateway = commandGateway;
+        this.activeMuteTimers = new Map(); // groupJid -> timerId or tracking entry
     }
 
     /**
      * Mutes a group by enabling announcement mode.
+     * Enters the authoritative durable connection_commands control plane when commandRepo is available.
      * @param {import('../context/ApplicationContext')} appCtx
      * @param {number} [durationInMinutes]
-     * @returns {Promise<{ success: boolean, error?: string }>}
+     * @returns {Promise<{ success: boolean, commandId?: string, error?: string }>}
      */
     async muteGroup(appCtx, durationInMinutes) {
         if (!appCtx.group || appCtx.group.status !== 'MANAGED') {
@@ -26,6 +35,29 @@ class ModerationService {
             return { success: false, error: 'Only group admins can mute the group' };
         }
 
+        // 1. Authoritative Durable Path: Submit MUTE_GROUP command into connection_commands
+        if (this.commandRepo && appCtx.tenantId && appCtx.connectionId && appCtx.group?.id) {
+            const command = await this.commandRepo.createCommand(null, {
+                tenantId: appCtx.tenantId,
+                connectionId: appCtx.connectionId,
+                groupId: appCtx.group.id,
+                commandType: 'MUTE_GROUP',
+                payload: durationInMinutes ? { durationMinutes: durationInMinutes } : {},
+            });
+
+            if (this.commandGateway) {
+                this.commandGateway.sendCommand({
+                    command: 'MUTE_GROUP',
+                    tenantId: appCtx.tenantId,
+                    connectionId: appCtx.connectionId,
+                    payload: { commandId: command.id, durationMinutes },
+                }).catch(() => {});
+            }
+
+            return { success: true, commandId: command.id };
+        }
+
+        // 2. Fallback for standalone unit test mocks (where commandRepo/database are omitted)
         const success = await this.gateway.muteGroup(appCtx.group.whatsappJid);
         if (!success) {
             return { success: false, error: 'Failed to update group setting' };
@@ -35,7 +67,10 @@ class ModerationService {
 
         // Cancel any existing pending mute timer for this group
         if (this.activeMuteTimers.has(groupJid)) {
-            clearTimeout(this.activeMuteTimers.get(groupJid));
+            const entry = this.activeMuteTimers.get(groupJid);
+            if (entry && !entry.durable) {
+                clearTimeout(entry);
+            }
             this.activeMuteTimers.delete(groupJid);
         }
 
@@ -65,8 +100,9 @@ class ModerationService {
 
     /**
      * Unmutes a group by disabling announcement mode.
+     * Enters the authoritative durable connection_commands control plane when commandRepo is available.
      * @param {import('../context/ApplicationContext')} appCtx
-     * @returns {Promise<{ success: boolean, error?: string }>}
+     * @returns {Promise<{ success: boolean, commandId?: string, error?: string }>}
      */
     async unmuteGroup(appCtx) {
         if (!appCtx.group || appCtx.group.status !== 'MANAGED') {
@@ -79,15 +115,56 @@ class ModerationService {
             return { success: false, error: 'Only group admins can unmute the group' };
         }
 
+        // 1. Authoritative Durable Path: Submit UNMUTE_GROUP command into connection_commands
+        if (this.commandRepo && appCtx.tenantId && appCtx.connectionId && appCtx.group?.id) {
+            if (this.taskRepo) {
+                await this.taskRepo.cancelTasksForGroup(null, {
+                    tenantId: appCtx.tenantId,
+                    groupId: appCtx.group.id,
+                    action: 'UNMUTE_GROUP',
+                }).catch(() => {});
+            }
+
+            const command = await this.commandRepo.createCommand(null, {
+                tenantId: appCtx.tenantId,
+                connectionId: appCtx.connectionId,
+                groupId: appCtx.group.id,
+                commandType: 'UNMUTE_GROUP',
+                payload: {},
+            });
+
+            if (this.commandGateway) {
+                this.commandGateway.sendCommand({
+                    command: 'UNMUTE_GROUP',
+                    tenantId: appCtx.tenantId,
+                    connectionId: appCtx.connectionId,
+                    payload: { commandId: command.id },
+                }).catch(() => {});
+            }
+
+            return { success: true, commandId: command.id };
+        }
+
+        // 2. Fallback for standalone unit test mocks
         const success = await this.gateway.unmuteGroup(appCtx.group.whatsappJid);
         if (!success) {
             return { success: false, error: 'Failed to update group setting' };
         }
 
         const groupJid = appCtx.group.whatsappJid;
-        // Cancel any pending in-memory unmute timer
+        if (this.taskRepo && appCtx.tenantId && appCtx.group?.id) {
+            await this.taskRepo.cancelTasksForGroup(null, {
+                tenantId: appCtx.tenantId,
+                groupId: appCtx.group.id,
+                action: 'UNMUTE_GROUP',
+            }).catch(() => {});
+        }
+
         if (this.activeMuteTimers.has(groupJid)) {
-            clearTimeout(this.activeMuteTimers.get(groupJid));
+            const entry = this.activeMuteTimers.get(groupJid);
+            if (entry && !entry.durable) {
+                clearTimeout(entry);
+            }
             this.activeMuteTimers.delete(groupJid);
         }
 
@@ -108,7 +185,9 @@ class ModerationService {
      */
     clearAllMuteTimers() {
         for (const timer of this.activeMuteTimers.values()) {
-            clearTimeout(timer);
+            if (timer && !timer.durable) {
+                clearTimeout(timer);
+            }
         }
         this.activeMuteTimers.clear();
     }

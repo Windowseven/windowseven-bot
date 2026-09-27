@@ -165,6 +165,10 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
     // 1. ConnectionManager Abort & Reconnect Cancellation (Amendment 5)
     // =========================================================================
     describe('1. ConnectionManager Abort & Reconnect Cancellation', () => {
+        beforeEach(async () => {
+            await pool.query('DELETE FROM whatsapp_connections;');
+        });
+
         it('should cancel reconnect timers and set isAborted = true upon abortConnection()', async () => {
             const conn = await connRepo.createForTenant(tenantA.id, { displayName: 'Abort Test Conn' });
 
@@ -232,6 +236,24 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
     // 2. Atomic Lease Acquisition & Concurrency Protection (Amendment 4)
     // =========================================================================
     describe('2. Atomic Lease Acquisition & Concurrency Protection', () => {
+        beforeEach(async () => {
+            await pool.query('DELETE FROM whatsapp_connections;');
+        });
+
+        it('P0: never acquires an expired SOCKET_STOPPING generation until its owner releases after teardown', async () => {
+            const conn = await connRepo.createForTenant(tenantA.id, { displayName: 'stopping-fence' });
+            await connRepo.updateDesiredStateForTenant(conn.id, tenantA.id, 'RUNNING');
+            const leaseA = await connRepo.acquireLease({ connectionId: conn.id, tenantId: tenantA.id, workerId: 'worker-stop-a' });
+            await connRepo.updateActualState({ connectionId: conn.id, workerId: 'worker-stop-a', leaseEpoch: leaseA.leaseEpoch, actualState: 'SOCKET_STOPPING' });
+            // Simulates a lost heartbeat; expiry is not permission to overlap teardown.
+            await pool.query("UPDATE whatsapp_connections SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1", [conn.id]);
+            const leaseBWhileStopping = await connRepo.acquireLease({ connectionId: conn.id, tenantId: tenantA.id, workerId: 'worker-stop-b' });
+            assert.strictEqual(leaseBWhileStopping, null);
+            await connRepo.releaseLease({ connectionId: conn.id, workerId: 'worker-stop-a', leaseEpoch: leaseA.leaseEpoch });
+            const leaseBAfterRelease = await connRepo.acquireLease({ connectionId: conn.id, tenantId: tenantA.id, workerId: 'worker-stop-b' });
+            assert.ok(leaseBAfterRelease);
+            assert.ok(leaseBAfterRelease.leaseEpoch > leaseA.leaseEpoch);
+        });
         it('Lease Race: concurrent acquisition attempts by two workers must result in exactly ONE winner', async () => {
             const conn = await connRepo.createForTenant(tenantA.id, { displayName: 'Lease Race Test' });
 
@@ -428,6 +450,10 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
     // 3. Worker Lease Manager & Watchdog Failsafe
     // =========================================================================
     describe('3. Worker Lease Manager & Watchdog Failsafe', () => {
+        beforeEach(async () => {
+            await pool.query('DELETE FROM whatsapp_connections;');
+        });
+
         it('should trip local watchdog and abort connection if heartbeat is not renewed', async () => {
             const conn = await connRepo.createForTenant(tenantA.id, { displayName: 'Watchdog Test' });
             const acquired = await connRepo.acquireLease({ connectionId: conn.id, tenantId: tenantA.id, workerId: 'watchdog-worker' });
@@ -473,6 +499,10 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
     // 4. State Reconciliation & Missed Signal Recovery (Amendment 3 & 7)
     // =========================================================================
     describe('4. State Reconciliation & Missed Signal Recovery', () => {
+        beforeEach(async () => {
+            await pool.query('DELETE FROM whatsapp_connections;');
+        });
+
         it('Worker reconciliation loop discovers RUNNING connection in DB even if NOTIFY was missed', async () => {
             const conn = await connRepo.createForTenant(tenantA.id, { displayName: 'Reconciliation Test' });
             // Set desired_state = RUNNING directly in DB (simulating missed wake-up signal)
@@ -510,6 +540,10 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
     // =========================================================================
     describe('5. REST Connection Lifecycle APIs & Tenant RBAC', () => {
         let createdConnId;
+
+        before(async () => {
+            await pool.query('DELETE FROM whatsapp_connections;');
+        });
 
         it('5.1 MEMBER role is rejected from creating a connection (403)', async () => {
             const res = await request('POST', `/api/v1/tenants/${tenantA.id}/connections`, {
@@ -637,6 +671,7 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
         let connB;
 
         before(async () => {
+            await pool.query('DELETE FROM whatsapp_connections;');
             connB = await connRepo.createForTenant(tenantB.id, { displayName: 'Tenant B Secret Conn' });
         });
 
@@ -657,9 +692,10 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
         });
 
         it('Cross-tenant probing logs UNAUTHORIZED_CONNECTION_ACCESS in audit_logs while returning 404', async () => {
-            const probeConn = await connRepo.createForTenant(tenantB.id, { displayName: 'Tenant B Target' });
+            const tenantC = await tenantRepo.create({ name: 'Tenant C', slug: 'tenant-c-' + Date.now() });
+            const probeConn = await connRepo.createForTenant(tenantC.id, { displayName: 'Tenant C Target' });
 
-            // Tenant A owner requests Tenant B's connection via Tenant A URL
+            // Tenant A owner requests Tenant C's connection via Tenant A URL
             const res = await request('GET', `/api/v1/tenants/${tenantA.id}/connections/${probeConn.id}`, {
                 headers: { 'Authorization': `Bearer ${tokenOwnerA}` },
             });
@@ -671,7 +707,7 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
             const probeLog = auditLogs.find((l) => l.action === 'UNAUTHORIZED_CONNECTION_ACCESS' && l.resource_id === probeConn.id);
             assert.ok(probeLog, 'UNAUTHORIZED_CONNECTION_ACCESS audit log must be recorded');
             assert.strictEqual(probeLog.actor_user_id, userOwnerA.id);
-            assert.strictEqual(probeLog.metadata.actualTenantId, tenantB.id);
+            assert.strictEqual(probeLog.metadata.actualTenantId, tenantC.id);
         });
     });
 
@@ -682,6 +718,7 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
         let testConn;
 
         before(async () => {
+            await pool.query('DELETE FROM whatsapp_connections;');
             testConn = await connRepo.createForTenant(tenantA.id, { displayName: 'QR Lifecycle Test' });
         });
 
@@ -727,6 +764,7 @@ describe('Phase 4D: WhatsApp Connection Lifecycle, Worker Ownership & SSE', () =
         });
 
         it('Section 10 Scenario: QR generation fencing rejects stale generation QR after handoff', async () => {
+            await pool.query('DELETE FROM whatsapp_connections WHERE id = $1', [testConn.id]);
             const qrConn = await connRepo.createForTenant(tenantA.id, { displayName: 'QR Fencing Conn' });
 
             // Acquire at epoch 2

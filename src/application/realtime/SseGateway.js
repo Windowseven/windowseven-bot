@@ -60,6 +60,13 @@ class SseGateway {
             );
         }
 
+        // Disable request/socket timeouts for long-lived SSE streaming
+        if (typeof req.setTimeout === 'function') req.setTimeout(0);
+        if (typeof res.setTimeout === 'function') res.setTimeout(0);
+        if (req.socket && typeof req.socket.setTimeout === 'function') {
+            req.socket.setTimeout(0);
+        }
+
         // 1. Set SSE streaming headers
         res.writeHead(200, {
             'Content-Type': 'text/event-stream',
